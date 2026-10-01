@@ -3,14 +3,13 @@
 How to run the security checks in this repo. Every command here has been run against this
 workspace; output shapes are real, not illustrative.
 
-**Scope today:** static analysis (ruff / flake8-bandit). The attack suite and dependency
-scanning sections are stubbed and fill in as [PLAN.md](PLAN.md) progresses — see
-[Coming later](#5-coming-later).
+**Scope today:** static analysis (ruff / flake8-bandit) and the attack suite. Dependency
+scanning fills in at step 17 — see [Coming later](#5-coming-later).
 
 | Layer | Finds | Status |
 |---|---|---|
 | SAST — ruff `S` rules | taint-shaped and API-misuse-shaped defects in our code | **active** |
-| Attack suite — `pytest -m attack` | authorization and protocol flaws SAST cannot see | from step 1 |
+| Attack suite — `pytest -m attack` | authorization and protocol flaws SAST cannot see | **active** (step 1) |
 | SCA — `pip-audit` | known CVEs in dependencies | from step 17 |
 | Secret scanning — pre-commit | credentials heading for a commit | **active** (see `THREAT_MODEL.md` F-01) |
 
@@ -75,8 +74,8 @@ working" index — if a step lands and its rule never fired, check why.
 
 | Rule | Name | Expected at |
 |---|---|---|
-| `S608` | hardcoded-sql-expression | Step 2 — SQL injection in product search |
-| `S105` `S106` `S107` | hardcoded-password string / arg / default | Step 0 (fired), step 3 AS secrets |
+| `S608` | hardcoded-sql-expression | Step 2 — SQL injection in product search. **Narrower than it looks:** matches only SELECT/INSERT/UPDATE/DELETE (see §4) |
+| `S105` `S106` `S107` | hardcoded-password string / arg / default | **Confirmed step 0.** Step 3 AS secrets |
 | `S104` | hardcoded-bind-all-interfaces | Step 8 — binding `rlmcp` to `0.0.0.0` |
 | `S311` | suspicious-non-cryptographic-random | Step 12 — state handles built with `random` |
 | `S113` | request-without-timeout | Step 9 — JWKS / token-exchange fetches |
@@ -158,8 +157,28 @@ Step 3 is how that gets enforced — nothing else checks it.
 ### What ruff cannot find
 
 The limits matter more than the coverage, and F-02 records this as a prediction to confirm
-empirically rather than assume. Ruff is expected to catch step 2's SQL injection and
-**none** of these:
+empirically rather than assume.
+
+**Confirmed at step 1 — `S608` is much narrower than its name suggests.** Probing which
+statement keywords it recognises inside an f-string:
+
+| Interpolated statement | Flagged? |
+|---|---|
+| `f"SELECT * FROM {name}"` | yes |
+| `f"PRAGMA {name}"` | **no** |
+| `f"VACUUM {name}"` | **no** |
+| `f"ATTACH DATABASE '{name}' AS x"` | **no** |
+
+`S608` matches on SELECT/INSERT/UPDATE/DELETE. Everything else passes clean — including
+`ATTACH DATABASE`, which is a file read/write primitive. This bit in real code:
+`rlapi.db.effective_pragmas` must interpolate a pragma name (pragmas take no bound
+parameters) and ruff reported nothing, so its `_READABLE_PRAGMAS` allowlist is a control
+**no linter will ever remind us to keep**. Recorded as `THREAT_MODEL.md` F-05.
+
+Take-away for the rest of the project: do not read a clean `--select S` run as "no
+injection". Read it as "no injection in the four statement shapes ruff knows".
+
+Ruff is still expected to catch step 2's SQL injection, and **none** of these:
 
 - **Step 4** — audience validation gap. `jwt.decode(token, key)` without `audience=` is a
   syntactically correct API call.
@@ -176,20 +195,49 @@ Pattern-matching SAST finds taint-shaped and API-misuse-shaped defects. **Author
 flaws are invisible to it**, because vulnerable code looks exactly like correct code minus a
 comparison against state the linter has no model of. That is why `tests/attacks/` exists.
 
-## 5. Coming later
+## 5. The attack suite
 
-### Attack suite — from step 1
+Active since step 1. This is the layer that covers what §4 says SAST cannot.
 
 ```bash
 uv run pytest -m attack              # every exploit
 uv run pytest -m mcp07               # one OWASP risk
 uv run pytest -m "attack and mcp02"
+uv run pytest                        # everything
 ```
 
+Current counts (step 1): **61 tests, 22 marked `attack`.** Breakdown:
+
+| Module | Covers | `THREAT_MODEL.md` |
+|---|---|---|
+| `attacks/test_fk_enforcement.py` | SQLite FK enforcement off by default; pragma no-op in a transaction; per-connection scope | F-03 |
+| `attacks/test_role_column_integrity.py` | `users.role` accepting arbitrary values; enum stored as name vs value | F-04 |
+| `unit/test_models.py` | CHECK-constraint backstops for negative money/quantities | F-03/F-04 support |
+| `unit/test_migrations.py` | migration/model drift, reversibility, no pinned DB URL | F-06, F-07 |
+
+### Proving a control is load-bearing
+
+A test that has never failed against vulnerable code proves nothing. Two ways to establish
+that, both used at step 1:
+
+1. **Keep the vulnerable configuration as a fixture.** `test_fk_enforcement.py` has both
+   `hardened_engine` and `unhardened_engine` and asserts opposite outcomes against each, so
+   the contrast is permanent rather than historical.
+2. **Remove the control and watch the right tests fail.** Comment out the one line that
+   registers the hardening listener and re-run:
+
+   ```bash
+   uv run pytest tests/attacks/test_fk_enforcement.py -q
+   ```
+
+   At step 1 this produced exactly `5 failed, 9 passed` — the 5 asserting hardened
+   behaviour, with the 9 asserting SQLite's *defaults* correctly unaffected. If removing a
+   control does not break anything, the control is untested.
+
 Markers are declared in `pyproject.toml` (`mcp01`–`mcp10`, plus `attack`). Conventions and
-the per-module header format are in [tests/attacks/README.md](tests/attacks/README.md). The
-rule that gives these tests meaning: each must have been observed to **succeed** against
-the vulnerable commit before the fix landed.
+the per-module header format are in [tests/attacks/README.md](tests/attacks/README.md).
+
+## 6. Coming later
 
 ### Dependency scanning — from step 17
 

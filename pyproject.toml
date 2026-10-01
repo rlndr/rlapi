@@ -77,6 +77,14 @@ ignore = [
     "S311", # non-cryptographic random
     "ANN",  # annotations optional in tests
 ]
+# Alembic writes these. Hand-wrapping generated `sa.Column(...)` lines creates
+# churn on every --autogenerate run for no safety gain. Note this exempts only
+# formatting: the `S` security rules still apply, because a migration runs
+# arbitrary SQL against production data.
+"packages/*/src/*/migrations/versions/*.py" = [
+    "E501", # line too long
+    "W291", # trailing whitespace
+]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

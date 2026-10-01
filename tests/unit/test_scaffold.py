@@ -12,13 +12,13 @@ WORKSPACE_PACKAGES = ["rlapi", "rlas", "rlmcp"]
 
 
 @pytest.mark.parametrize("name", WORKSPACE_PACKAGES)
-def test_package_is_importable(name):
+def test_package_is_importable(name: str) -> None:
     module = importlib.import_module(name)
     assert module.__version__ == "0.0.0"
 
 
 @pytest.mark.parametrize("name", WORKSPACE_PACKAGES)
-def test_package_is_installed_from_source_tree(name):
+def test_package_is_installed_from_source_tree(name: str) -> None:
     """Guard against a stale wheel shadowing the editable install."""
     module = importlib.import_module(name)
     assert module.__file__ is not None

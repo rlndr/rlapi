@@ -74,7 +74,104 @@ name-based rule never would.
 ---
 
 ## Phase 1 — The CRUD API
-*(steps 1–6; entries added as each lands)*
+
+### F-03 · SQLite does not enforce foreign keys by default
+- **Severity:** High · **Category:** AppSec / data integrity
+- **Attacked:** inserted an `order_item` referencing order `99999`; deleted a product that
+  order items referenced, with `ON DELETE RESTRICT` declared on the column.
+- **Finding:** both succeeded. `PRAGMA foreign_keys` defaults to `0`, so every
+  `ON DELETE CASCADE`/`RESTRICT` in the schema was decorative. A schema that reads as fully
+  constrained was half enforced.
+- **Control:** `PRAGMA foreign_keys = ON` applied from a SQLAlchemy `connect` event
+  listener in `rlapi.db`, plus `assert_hardened()` as a startup check.
+- **Two traps that make this easy to get wrong**, both verified:
+  1. **The pragma is a no-op inside a transaction, and raises no error.** Setting it via
+     `Session.execute` or `engine.execute` appears to succeed and changes nothing, because
+     SQLAlchemy has already opened a transaction. This is why the `connect` event is the
+     only correct hook — it fires before any transaction exists.
+  2. **It is per *connection*, not per database.** Hardening once at startup leaves every
+     subsequent pooled connection unprotected. Of the four hardening pragmas, only
+     `journal_mode` persists in the database file; the other three reset on every connect.
+- **Verified by removal:** with the listener commented out, exactly the 5 tests asserting
+  hardened behaviour failed and the 9 asserting SQLite's defaults still passed. The control
+  is load-bearing, not incidental.
+- **Deliberate omission:** `create_db_engine` has **no** `enforce_foreign_keys=False`
+  option. A flag that disables an integrity control is a footgun; the attack suite builds
+  its own unhardened engine instead, so the shipped API cannot be misconfigured into the
+  vulnerable state.
+- **Tests:** `tests/attacks/test_fk_enforcement.py` (14)
+
+### F-04 · `users.role` accepted arbitrary values
+- **Severity:** High · **Category:** AppSec / IAM · **OWASP:** MCP07 (precursor)
+- **Attacked:** wrote `'root'`, `'ADMIN'`, `'admin '`, `''`, `'customer,admin'` and a
+  64-character string into the column that step 5's authorization will read.
+- **Finding:** all accepted. Three compounding causes:
+  1. **`SQLAlchemy.Enum.create_constraint` defaults to `False`** (since 1.4), so
+     `Enum(Role)` emitted a bare `VARCHAR(8)` with no CHECK constraint at all.
+  2. **SQLite ignores VARCHAR length.** A 64-character value went into `VARCHAR(8)`
+     without complaint, so column width is never a control on SQLite.
+  3. **The enum stored member *names*, not values** — `Role.CUSTOMER` landed as
+     `'CUSTOMER'` while the API, the JWT `roles` claim and the codebase all say
+     `'customer'`.
+- **Why it matters beyond tidiness:** cause 3 is the dangerous one. A role column holding
+  `'CUSTOMER'` while the token claim says `'customer'` fails a strict comparison — and
+  whether that fails open or closed depends entirely on which side gets normalised. The
+  `'admin '` variant is worse: it is not `== 'admin'`, but it survives a `TRIM()` or `LIKE`
+  comparison and reads as `admin` in a log.
+- **Control:** `rlapi.models.strict_enum()` — `create_constraint=True` for the DDL CHECK,
+  `values_callable` to store values, `validate_strings=True` so the ORM rejects unknown
+  strings before SQL is emitted. Two independent layers, since raw SQL and migrations
+  bypass the ORM one.
+- **Residual risk:** the CHECK constraint is a backstop. Step 5's authorization logic is
+  the control, and it must still never trust this column's contents to be a valid `Role`
+  without parsing it.
+- **Tests:** `tests/attacks/test_role_column_integrity.py` (26)
+
+### F-05 · ruff S608 misses most interpolated SQL — F-02's prediction, partly refuted
+- **Severity:** Medium · **Category:** DevSecOps
+- **Attacked:** probed which statement keywords `S608` recognises in an f-string.
+- **Finding:** of `PRAGMA {name}`, `SELECT * FROM {name}`, `VACUUM {name}` and
+  `ATTACH DATABASE '{name}' AS x`, **only `SELECT` was flagged.** `S608` matches on
+  SELECT/INSERT/UPDATE/DELETE, so the other three pass clean — and `ATTACH DATABASE` is a
+  file read/write primitive, arguably the most dangerous of the four.
+- **Consequence here:** `rlapi.db.effective_pragmas` must interpolate a pragma name
+  (pragmas take no bound parameters). Ruff reported nothing. The `_READABLE_PRAGMAS`
+  allowlist is therefore a control **no linter will ever remind us to keep**, which is now
+  stated in the code comment and covered by a test.
+- **Correction to F-02:** that entry predicted ruff would "catch step 2's SQLi". Refine
+  that: it catches *some* SQL injection, specifically statements whose first keyword is one
+  of four. SAST coverage is narrower than the rule name suggests.
+- **Tests:** `test_effective_pragmas_rejects_names_outside_the_allowlist`
+
+### F-06 · Autogenerated migrations need review, not trust
+- **Severity:** Low · **Category:** DevSecOps / data integrity
+- **Finding:** `alembic revision --autogenerate` rendered each enum CHECK constraint
+  **explicitly twice**, on top of the implicit one from `sa.Enum(create_constraint=True)`
+  — three identical CHECK constraints per column in the emitted DDL. Functionally harmless,
+  but it means autogenerate output is not a faithful translation of the models.
+- **Control:** the redundant lines were removed by hand and the migration carries a note to
+  re-check on every future autogenerate run. `tests/unit/test_migrations.py` asserts zero
+  drift against `Base.metadata` via `compare_metadata`, plus exactly one CHECK per enum
+  column and a working `downgrade base`.
+- **Related risk recorded for later:** SQLite cannot `ALTER COLUMN`, so Alembic's
+  `render_as_batch` rebuilds tables. A rebuild drops and recreates constraints, making
+  batch migrations a moment when a CHECK or FK can silently go missing. Verify the schema
+  after one; do not assume.
+
+### F-07 · Alembic's default environment bypassed the hardening
+- **Severity:** Medium · **Category:** AppSec / data integrity
+- **Finding:** the generated `env.py` calls `engine_from_config` and builds its own
+  connection, which never passes through `rlapi.db`'s `connect` listener. Data migrations
+  would therefore have run with foreign key enforcement **off** — precisely the condition
+  F-03 exists to prevent, in the one context that rewrites data in bulk.
+- **Control:** `env.py` now builds its engine with `create_db_engine`. Migrations are held
+  to the same integrity rules as the application.
+- **Also changed:** the database URL moved out of `alembic.ini` into
+  `$RLAPI_DATABASE_URL`. Harmless for a local SQLite path, but by step 18 that line would
+  be a credential, and a test now asserts the ini pins no URL.
+
+## Phase 2 — Identity
+*(steps 3–6)*
 
 ## Phase 2 — Identity
 *(steps 3–6)*
@@ -103,3 +200,7 @@ actually stopped it?* Controls that stopped nothing get recorded too.
 | F-01 | Secret committed via an ignored filename | `.gitignore` | — |
 | F-01 | Secret committed via a *tracked* filename (`.py`) | `detect-private-key`, `detect-secrets`, ruff `S105` | `.gitignore` — matches names, not content |
 | F-01 | Secret already in history | rotation | `git rm`, `filter-branch`; and `gc` only after `refs/original` + reflog were cleared |
+| F-03 | Orphan `order_item`; deleting a referenced product | `PRAGMA foreign_keys = ON` via the `connect` event | the declared `ON DELETE RESTRICT`/`CASCADE` — inert without the pragma; setting the pragma in a transaction or once at startup |
+| F-04 | Writing `'root'` / `'admin '` / 64 chars into `users.role` | `create_constraint=True` CHECK, plus ORM `validate_strings` | `VARCHAR(8)` — SQLite ignores length; `Enum(Role)` alone — emits no constraint |
+| F-05 | Interpolated `PRAGMA` / `ATTACH DATABASE` | hand-written `_READABLE_PRAGMAS` allowlist | ruff `S608` — matches only SELECT/INSERT/UPDATE/DELETE |
+| F-07 | Migrations running without FK enforcement | `env.py` using `create_db_engine` | Alembic's generated `env.py` |

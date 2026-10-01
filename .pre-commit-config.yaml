@@ -1,12 +1,16 @@
 # Pre-commit is the preventative half of secret hygiene. See THREAT_MODEL.md
 # "Phase 0" for the limits of this control.
 #
-# Tool choice note: the usual recommendation here is gitleaks, but its
-# pre-commit hook is `language: golang` and this machine has no Go toolchain.
-# detect-secrets (pure Python) plus the built-in detect-private-key hook cover
-# the same ground for this project. If a Go toolchain appears later, adding
-# gitleaks is worthwhile -- it has a broader rule set and scans history, which
-# detect-secrets only does via its baseline.
+# Tool choice note: the usual recommendation here is gitleaks. Its upstream
+# pre-commit hook is `language: golang`, which would build it from source and
+# needs a Go toolchain this machine lacks -- but gitleaks ships prebuilt static
+# binaries, so the real prerequisite is the binary, not Go. If you install it,
+# wire it as a `repo: local` hook with `language: system` rather than adding Go.
+#
+# Not installed, deliberately: detect-private-key + detect-secrets + ruff
+# S105/S106/S107 caught all four attempts in the step 0 exercise
+# (THREAT_MODEL.md F-01). gitleaks' marginal value here is its broader rule set
+# and history scanning, and this history has no pre-hook window to audit.
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

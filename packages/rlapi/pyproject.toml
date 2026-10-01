@@ -3,7 +3,10 @@ name = "rlapi"
 version = "0.0.0"
 description = "CRUD API over inventory and orders; an OAuth 2.1 resource server."
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "alembic>=1.14",
+    "sqlalchemy>=2.0",
+]
 
 [build-system]
 requires = ["hatchling"]

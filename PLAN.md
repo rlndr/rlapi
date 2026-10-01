@@ -148,6 +148,9 @@ audit_log:    id, ts, actor_sub, action, resource, decision, request_id
 
 Roles: `customer`, `clerk`, `manager`, `admin`.
 
+**Status: done.** 61 tests (22 `attack`), ruff + mypy `--strict` clean, zero `noqa`
+suppressions. Findings in `THREAT_MODEL.md` F-03 … F-07.
+
 **Break** — SQLite does **not** enforce foreign keys by default. Insert an `order_item`
 referencing order `99999`, watch it succeed. Delete a product that order items reference,
 watch them dangle.
@@ -157,9 +160,32 @@ listener (it is per-connection, not per-database — a pooled app must set it on
 Also set `journal_mode=WAL` and a `busy_timeout`.
 
 **Verify** — `tests/attacks/test_fk_enforcement.py` asserts `IntegrityError` on the orphan
-insert. Confirm it fails against the pre-fix commit.
+insert. Confirmed load-bearing by removing the listener: exactly 5 hardened-behaviour tests
+failed, and the 9 asserting SQLite's defaults correctly passed either way.
 
-→ Data integrity · **CHECKPOINT**
+**Four findings beyond the planned one:**
+1. **`PRAGMA foreign_keys` is a no-op inside a transaction and raises no error** (F-03).
+   Setting it via `Session.execute` looks like it worked and does nothing. This is *why* the
+   `connect` event is the only correct hook, not merely a tidier one.
+2. **`users.role` accepted `'root'`, `'admin '`, `''` and 64 characters** (F-04).
+   `SQLAlchemy.Enum.create_constraint` defaults to `False`, so the DDL was a bare
+   `VARCHAR(8)` with no CHECK — and SQLite ignores VARCHAR length. The enum also stored
+   member *names* (`'CUSTOMER'`) rather than values (`'customer'`), which step 5's
+   authorization comparison would have hit silently. Fixed with `models.strict_enum()`.
+3. **ruff `S608` only matches SELECT/INSERT/UPDATE/DELETE** (F-05). `f"PRAGMA {name}"`,
+   `f"VACUUM {name}"` and `f"ATTACH DATABASE '{name}'"` all pass clean. Partly refutes the
+   F-02 prediction and changes how a clean SAST run should be read.
+4. **Alembic's generated `env.py` bypassed the hardening** (F-07), so data migrations would
+   have run with FK enforcement off — the one context that rewrites data in bulk. Also,
+   autogenerate triplicated each enum CHECK constraint (F-06): its output needs review, not
+   trust.
+
+**Design choice worth noting:** `create_db_engine` has no `enforce_foreign_keys=False`
+option. The attack suite builds its own unhardened engine instead, so the shipped API cannot
+be configured into the vulnerable state. Prefer this shape over a flag for the rest of the
+plan — step 8's `validate_token_resource` is the same decision.
+
+→ Data integrity, **MCP07** (precursor) · **CHECKPOINT**
 
 ### Step 2 · CRUD endpoints and input validation · `[1-2h]`
 
