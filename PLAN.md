@@ -69,6 +69,7 @@ rlapi/
 ├─ PLAN.md                  ← this file
 ├─ ARCHITECTURE.md          ← trust boundaries, created in step 0
 ├─ THREAT_MODEL.md          ← appended to each step
+├─ SECURITYTEST.md          ← how to run the security checks; updated each step
 ├─ pyproject.toml           ← uv workspace root
 ├─ packages/
 │  ├─ rlapi/                ← CRUD API
