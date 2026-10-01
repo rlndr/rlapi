@@ -12,17 +12,52 @@ Severity follows the rubric in PLAN.md: Critical / High / Medium / Low / Informa
 
 ### F-01 · Secrets reachable in git history
 - **Severity:** High (if realised) · **Category:** DevSecOps
-- **Attacked:** committed a file containing a signing key, then tried to remove it.
-- **Finding:** `.gitignore` and `detect-secrets` are **preventative only**. Once an object
-  reaches the database it is reachable via `git log -p`, `git cat-file`, reflogs, and any
-  clone or fork that already pulled it. `git rm` does not remove it; history rewriting does
-  not remove it from existing clones.
-- **Control that works:** rotation. A committed key is a compromised key. The pre-commit
-  hook reduces the *rate* of this incident; it cannot remediate one.
-- **Residual risk:** a hook is bypassable with `--no-verify`, and only runs locally. Server-
-  side scanning is the control that does not depend on developer cooperation. Not in scope
-  here (no remote), but noted as the gap.
-- **Status:** control in place (`detect-private-key`, `detect-secrets`, `.gitignore`).
+- **Attacked:** generated a throwaway RSA signing key — the artifact `rlas` will actually
+  hold from step 3 — and tried four ways to get it committed, then tried to remove it.
+
+**Prevention layers, as measured:**
+
+| Attempt | `.gitignore` | pre-commit | Result |
+|---|---|---|---|
+| `git add .env` | **blocked** (`*.env`) | not reached | stopped |
+| `git add .env packages/rlas/src/rlas/signing_key.pem` | **blocked** (`*.pem`) | not reached | stopped |
+| `git add -f` the same two files | bypassed by `-f` | **blocked** by `detect-private-key` *and* `detect-secrets` | stopped |
+| secrets inlined in `packages/rlas/src/rlas/dev_config.py` | **missed entirely** — `.py` is not an ignored pattern | **blocked** by `detect-private-key`, `detect-secrets`, and ruff `S105` ×2 | stopped |
+
+The fourth row is the realistic one. `.gitignore` matches *names*, so it only ever catches
+the filenames someone anticipated. A secret pasted into a legitimately-tracked source file
+is invisible to it. Content-based scanning is the layer that generalises — and ruff's
+`S105` caught the non-PEM secrets (`AS_CLIENT_SECRET`, a JWT-shaped token) that a
+name-based rule never would.
+
+**Remediation, as measured.** The interesting half. Committed with `--no-verify`, then:
+
+| Remediation | Secret still retrievable? |
+|---|---|
+| `git rm --cached` + commit | **yes** — `git cat-file -p <blob>` returns it verbatim; `git log -p -S` occurrences went *up* from 1 to 2, since the removal commit shows the content as a deletion diff |
+| `git filter-branch --index-filter` (full history rewrite) | **yes** — kept alive by `refs/original` and 8 reflog entries |
+| `rm -rf .git/refs/original && git reflog expire --expire=now --all && git gc --prune=now` | no — blob finally unreachable |
+
+- **Control that works:** rotation. A committed key is a compromised key, and three commands
+  deep into remediation it was still readable. Everything above is damage limitation.
+- **Residual risk:** every clone, fork, CI cache, and backup taken before the prune still
+  has it, and no local command reaches those. Also: the hooks are local and bypassable with
+  `--no-verify` (which is exactly how this demo committed the secret). Server-side scanning
+  is the only layer that does not depend on developer cooperation — out of scope here since
+  there is no remote, but recorded as the real gap.
+- **Status:** controls in place and verified (`.gitignore`, `detect-private-key`,
+  `detect-secrets`, ruff `S105`). No key material entered this repo's history —
+  verified with `git log --all -p -S` for the PEM private-key header and each demo
+  literal: 0 hits.
+
+- **Footnote worth keeping.** Writing this entry tripped the controls it describes: quoting
+  the PEM header literally in prose made `detect-private-key` and `detect-secrets` fail on
+  `THREAT_MODEL.md` itself. Resolved by rewording, not by allowlisting — a documentation
+  false positive is not worth an entry in `.secrets.baseline`, and widening the `exclude`
+  pattern to cover Markdown would have blinded the hook to secrets pasted into docs, which
+  is a real way they leak. Where a *fixture* legitimately trips a hook later, audit it into
+  the baseline (`uv run detect-secrets audit .secrets.baseline`) so the decision is
+  recorded, or use an inline `pragma: allowlist secret`.
 
 ### F-02 · SAST as an early signal
 - **Severity:** Informational · **Category:** DevSecOps
@@ -65,4 +100,6 @@ actually stopped it?* Controls that stopped nothing get recorded too.
 
 | # | Attack | Control that stopped it | Controls that did not help |
 |---|---|---|---|
-| F-01 | Secret in git history | — (rotation only) | `.gitignore`, pre-commit hook (both preventative) |
+| F-01 | Secret committed via an ignored filename | `.gitignore` | — |
+| F-01 | Secret committed via a *tracked* filename (`.py`) | `detect-private-key`, `detect-secrets`, ruff `S105` | `.gitignore` — matches names, not content |
+| F-01 | Secret already in history | rotation | `git rm`, `filter-branch`; and `gc` only after `refs/original` + reflog were cleared |

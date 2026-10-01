@@ -101,18 +101,31 @@ Flagging these now so they are not surprises:
 
 ### Step 0 · Scaffold and threat model skeleton · `[1h]`
 
+**Status: done** (commit `d168708` + follow-up). Deviations from the original plan:
+- **gitleaks dropped for `detect-secrets`.** The gitleaks pre-commit hook is
+  `language: golang` and this machine has no Go toolchain. `detect-secrets` is pure Python
+  and covers the same ground here. Worth revisiting if Go appears — gitleaks has a broader
+  rule set and scans history, which `detect-secrets` does only via its baseline.
+- **`no-commit-to-branch` dropped.** It blocks the per-step commits (and merge commits) to
+  `main` that this workflow depends on.
+- **A real smoke test was added** rather than running pytest with zero tests — an empty run
+  exits 5, not 0, so "green with zero tests" was not achievable as written.
+
 **Build**
 - `uv init` workspace, three packages, `uv python pin 3.13`
-- ruff + mypy `--strict` + pytest, pre-commit with `detect-secrets` and `gitleaks`
+- ruff + mypy `--strict` + pytest, pre-commit with `detect-private-key` and `detect-secrets`
 - `.gitignore` covering `*.db`, `.env`, `*.pem`, `keys/`
 - `ARCHITECTURE.md` with the diagram above; `THREAT_MODEL.md` with empty per-phase sections
 - First commit
 
-**Break** — commit a fake `.env` containing `AS_SIGNING_KEY=...`, confirm the pre-commit
-hook rejects it. Then confirm that if it *had* landed, `git log -p` keeps it forever. This
-is the step-0 lesson: secret hygiene is preventative only.
+**Break** — try four ways to commit a throwaway RSA signing key, then try to remove it.
+Confirm the pre-commit hooks reject it, and that the layer which catches a secret pasted
+into a *tracked* `.py` file is content scanning, not `.gitignore`. Then confirm that once
+committed, `git rm` and even `filter-branch` leave the blob readable via `git cat-file`.
+The step-0 lesson: secret hygiene is preventative only; a committed key is a rotated key.
 
-**Verify** — `uv run pytest` green (zero tests), `pre-commit run --all-files` green.
+**Verify** — `uv run pytest` green, `uv run mypy` clean, `pre-commit run --all-files` green.
+Results recorded in `THREAT_MODEL.md` F-01.
 
 → **MCP01**, **MCP04** · **CHECKPOINT**
 
