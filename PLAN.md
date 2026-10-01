@@ -12,6 +12,70 @@ regression test.
 
 ---
 
+## 0. Where we are
+
+**Last worked: 2026-09-30.** Steps 0 and 1 complete. **Next: step 2** (CRUD endpoints and
+input validation).
+
+To resume: read this section, then step 2 below. Sanity check first —
+
+```bash
+uv run pytest -q          # 61 passed (22 marked `attack`)
+uv run mypy               # Success: no issues found in 16 source files
+uv run ruff check .       # All checks passed
+```
+
+Findings so far are in `THREAT_MODEL.md` F-01 … F-07; how to run the security checks is in
+`SECURITYTEST.md`. Commits: `d168708` `cfc5318` `7634dc4` `ee21257`.
+
+### Local development
+
+The dev database is **gitignored, so it is not in the repo** — recreate it if missing:
+
+```bash
+cd packages/rlapi
+RLAPI_DATABASE_URL="sqlite:///$PWD/../../rlapi-dev.db" uv run alembic upgrade head
+```
+
+That gives an empty schema. Seed rows (5 users one per role, 4 products, 3 orders across
+two customers) were created with a one-off inline script this session — there is no
+reusable seed script yet, see open items.
+
+**Browsing it with DBeaver or any external tool — read this first.** DBeaver is installed
+at `/usr/bin/dbeaver`, and it opens SQLite with `foreign_keys = 0`. Writes made there
+**bypass step 1's integrity control** and can create exactly the orphan rows F-03 defends
+against. `journal_mode = WAL` *is* persisted in the database file so external tools inherit
+it; `foreign_keys` is per-connection and is not. Either browse read-only, or add
+
+```sql
+PRAGMA foreign_keys = ON;
+```
+
+as connection-bootstrap SQL — then verify with `PRAGMA foreign_keys;` and confirm you get
+`1`, because this pragma fails *silently* rather than erroring (F-03).
+
+WAL also means `-wal`/`-shm` sidecars exist while connections are open: copy all three
+files or miss recent commits, and a GUI holding an open transaction can block the app's
+writes until `busy_timeout` (5s) expires.
+
+### Open items
+
+| # | Question | Current state |
+|---|---|---|
+| 1 | Reusable `scripts/seed_dev_db.py`? | Not written. Worth doing once step 2 starts changing the schema and step 5 needs specific role/ownership fixtures. |
+| 2 | Should `create_db_engine` get an `enforce_foreign_keys=False` flag for experimentation? | **No flag**, deliberately — the attack suite builds its own unhardened engine so the shipped API cannot be misconfigured. Raised for dissent; unanswered, current choice stands. Step 8's `validate_token_resource` is the same decision. |
+| 3 | Narrow the `tests/**` SAST exemptions to `tests/attacks/**` only? | Not done. Currently `S101`/`S105`/`S106`/`S311` are exempt across all of `tests/`, making the exploit code the least-scanned code in the repo (`SECURITYTEST.md` gotcha 2). |
+| 4 | Container runtime | **None installed** — no docker, podman, compose or nerdctl. Hard prerequisite for steps 17–18 (Keycloak, container hardening). Leaning podman for rootless-by-default. No urgency until step 17. |
+| 5 | Go toolchain / gitleaks | Decided against. gitleaks ships static binaries so Go is never needed; its marginal value here is low (`THREAT_MODEL.md` F-01). |
+
+### To check during step 2
+
+F-05 established that ruff `S608` only matches SELECT/INSERT/UPDATE/DELETE. Step 2 writes a
+deliberate SQL injection in the product search — confirm whether ruff actually flags it, and
+record the result against the F-02 prediction either way.
+
+---
+
 ## 1. Why this architecture
 
 Two separate services, because the interesting security questions only exist when there is
