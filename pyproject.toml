@@ -1,0 +1,119 @@
+# Virtual workspace root. The deliverable code lives in packages/*.
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+rlapi = { workspace = true }
+rlas = { workspace = true }
+rlmcp = { workspace = true }
+
+[dependency-groups]
+dev = [
+    # Workspace members, installed editable so tests import the real packages.
+    "rlapi",
+    "rlas",
+    "rlmcp",
+    # Test
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    # Lint / type / security tooling
+    "ruff>=0.14",
+    "mypy>=1.14",
+    "pre-commit>=4.0",
+    "detect-secrets>=1.5",
+    "pip-audit>=2.7",
+]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+# The `S` ruleset is flake8-bandit. It matters more than usual here: several
+# steps in PLAN.md deliberately introduce vulnerable code, and watching ruff
+# flag it before the exploit is even written is the cheapest SAST lesson in the
+# project. Vulnerable code committed on purpose must carry an explicit
+# `# noqa: S###  -- intentional, see PLAN.md step N` so the suppression is
+# auditable rather than invisible.
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["packages/rlapi/src", "packages/rlas/src", "packages/rlmcp/src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "F",     # pyflakes
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "ANN",   # flake8-annotations
+    "S",     # flake8-bandit  <- security
+    "B",     # flake8-bugbear
+    "A",     # flake8-builtins
+    "C4",    # flake8-comprehensions
+    "DTZ",   # flake8-datetimez (naive datetimes cause token-expiry bugs)
+    "T20",   # flake8-print (audit logs, not print())
+    "PT",    # flake8-pytest-style
+    "RET",   # flake8-return
+    "SIM",   # flake8-simplify
+    "ARG",   # flake8-unused-arguments
+    "PTH",   # flake8-use-pathlib
+    "ASYNC", # flake8-async
+    "TID",   # flake8-tidy-imports
+    "RUF",   # ruff-specific
+]
+ignore = [
+    "ANN401", # typing.Any is occasionally the honest annotation
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Attack scripts assert, hardcode fake credentials, and build hostile input.
+# That is their job.
+"tests/**" = [
+    "S101", # assert
+    "S105", # hardcoded password string
+    "S106", # hardcoded password argument
+    "S311", # non-cryptographic random
+    "ANN",  # annotations optional in tests
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+disallow_any_unimported = true
+mypy_path = ["packages/rlapi/src", "packages/rlas/src", "packages/rlmcp/src"]
+files = ["packages", "tests"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "attack: proves a specific vulnerability; must fail to exploit on fixed code",
+    "mcp01: OWASP MCP Top 10 - Token Mismanagement & Secret Exposure",
+    "mcp02: OWASP MCP Top 10 - Privilege Escalation via Scope Creep",
+    "mcp03: OWASP MCP Top 10 - Tool Poisoning",
+    "mcp04: OWASP MCP Top 10 - Supply Chain Attacks & Dependency Tampering",
+    "mcp05: OWASP MCP Top 10 - Command Injection & Execution",
+    "mcp06: OWASP MCP Top 10 - Intent Flow Subversion",
+    "mcp07: OWASP MCP Top 10 - Insufficient Authentication & Authorization",
+    "mcp08: OWASP MCP Top 10 - Lack of Audit & Telemetry",
+    "mcp09: OWASP MCP Top 10 - Shadow MCP Servers",
+    "mcp10: OWASP MCP Top 10 - Context Injection & Over-Sharing",
+]

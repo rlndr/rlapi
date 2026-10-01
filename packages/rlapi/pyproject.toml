@@ -1,0 +1,13 @@
+[project]
+name = "rlapi"
+version = "0.0.0"
+description = "CRUD API over inventory and orders; an OAuth 2.1 resource server."
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rlapi"]

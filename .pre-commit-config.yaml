@@ -1,0 +1,42 @@
+# Pre-commit is the preventative half of secret hygiene. See THREAT_MODEL.md
+# "Phase 0" for the limits of this control.
+#
+# Tool choice note: the usual recommendation here is gitleaks, but its
+# pre-commit hook is `language: golang` and this machine has no Go toolchain.
+# detect-secrets (pure Python) plus the built-in detect-private-key hook cover
+# the same ground for this project. If a Go toolchain appears later, adding
+# gitleaks is worthwhile -- it has a broader rule set and scans history, which
+# detect-secrets only does via its baseline.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: detect-private-key # RSA/EC private keys; rlas generates these in step 3
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.9
+    hooks:
+      - id: ruff-format
+      - id: ruff-check
+        args: ["--fix"]
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        # PLAN.md step 3 commits RSA *public* keys and test fixtures. When a
+        # finding is a deliberate fixture, audit it into the baseline with
+        # `uv run detect-secrets audit .secrets.baseline` rather than widening
+        # this exclude -- the baseline records the decision and who made it.
+        exclude: ^(uv\.lock|\.secrets\.baseline)$

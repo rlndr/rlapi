@@ -1,0 +1,44 @@
+# --- Secrets and key material -------------------------------------------
+# Step 0's lesson: these entries are preventative only. Anything that reaches
+# a commit stays in the object database forever, reachable via `git log -p`,
+# regardless of later deletion. A leaked key is rotated, not gitignored.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+keys/
+secrets/
+.secrets/
+
+# --- Local databases ----------------------------------------------------
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# --- Python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# --- Tool caches --------------------------------------------------------
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Local tooling output -----------------------------------------------
+sbom.json
+pip-audit.json
+
+# NOTE: uv.lock is intentionally NOT ignored. Step 17 depends on a committed,
+# hash-pinned lockfile as a supply-chain control (MCP04).
