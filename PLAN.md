@@ -33,7 +33,7 @@ other three are green. Run all four.
 
 Findings so far are in `THREAT_MODEL.md` F-01 … F-13; how to run the security checks is in
 `SECURITYTEST.md`. Commits: `d168708` `cfc5318` `7634dc4` `ee21257` `3a062b5` (step 2
-break) and the step 2 fix.
+break) `2fd5138` (step 2 fix).
 
 ### Local development
 
