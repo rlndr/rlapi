@@ -48,6 +48,13 @@ That gives an empty schema. Seed rows (5 users one per role, 4 products, 3 order
 two customers) were created with a one-off inline script in the step-1 session — there is
 still no reusable seed script, see open items.
 
+**The dev database has since been written to by hand**, so it no longer matches that
+description: as of 2026-10-05 it holds 5 products (`DRP-1000` added while testing) and 4
+orders, with order 2 moved to `placed` and order 4 created by the API. Nothing depends on
+its exact contents — the test suite uses its own temp databases — but do not treat it as a
+pristine fixture. `PRAGMA integrity_check` and `foreign_key_check` were both clean at the
+end of step 2.
+
 **Running the API** (added step 2):
 
 ```bash
