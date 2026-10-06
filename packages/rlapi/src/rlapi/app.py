@@ -54,13 +54,24 @@ def create_app(session_factory: sessionmaker[Session], *, engine: Engine | None 
 
 @contextmanager
 def app_from_env() -> Iterator[FastAPI]:
-    """Build an app against the database named by the environment.
+    """Build an app against the database named by the environment, and dispose it.
 
-    A context manager so the engine is disposed rather than leaked; the ASGI
-    entrypoint below keeps one for the process lifetime on purpose.
+    For scripts and ad-hoc use. `asgi_app_from_env` is the uvicorn entrypoint.
     """
     engine = create_db_engine(database_url())
     try:
         yield create_app(create_session_factory(engine), engine=engine)
     finally:
         engine.dispose()
+
+
+def asgi_app_from_env() -> FastAPI:
+    """Entrypoint for `uvicorn --factory rlapi.app:asgi_app_from_env`.
+
+    Holds its engine for the process lifetime rather than disposing it, which
+    is what a server wants and what makes this a separate function from
+    `app_from_env` -- a context manager cannot be a uvicorn factory, since the
+    factory must return the app itself.
+    """
+    engine = create_db_engine(database_url())
+    return create_app(create_session_factory(engine), engine=engine)

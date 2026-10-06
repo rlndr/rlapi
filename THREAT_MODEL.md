@@ -70,6 +70,15 @@ name-based rule never would.
   will **not** catch the IDOR in step 5, the audience-validation gap in step 4, or the
   state-handle hijack in step 12. Authorization flaws are invisible to pattern-matching
   linters. Worth confirming empirically rather than asserting.
+- **Step 2 result — the SQLi half is CONFIRMED, with a caveat that matters more than the
+  prediction.** Ruff flagged the search endpoint (F-11), and `RUF100` independently
+  confirmed the rule was live by not reporting the `# noqa: S608` as unused. But the
+  prediction was only right because the query happened to begin with `SELECT`: F-05 showed
+  the rule covers four keywords, and F-08 showed the keyword must sit in the *same string
+  expression* as the interpolation, so moving `SELECT` into a variable one line up hides the
+  same bug completely. The mass-assignment half of step 2 (F-10) was flagged by **nothing**.
+  Running total: of the two step-2 vulnerabilities, SAST found one.
+- **Still open:** the step 4, 5 and 12 predictions.
 
 ---
 
@@ -170,8 +179,138 @@ name-based rule never would.
   `$RLAPI_DATABASE_URL`. Harmless for a local SQLite path, but by step 18 that line would
   be a credential, and a test now asserts the ini pins no URL.
 
-## Phase 2 — Identity
-*(steps 3–6)*
+### F-08 · ruff S608 is defeated by splitting the query across two variables
+- **Severity:** Medium · **Category:** DevSecOps
+- **Attacked:** wrote the same injectable product search eight ways and ran `ruff --select
+  S608` over all of them (ruff 0.16.9).
+- **Finding:** **seven of eight were flagged** — f-string assigned to a variable, f-string
+  inline in `text()`, `+` concatenation, `.format()`, `%`-formatting, an interpolated
+  `ORDER BY` column, and `" AND ".join()` of a list containing an f-string. The one miss:
+
+  ```python
+  base = "SELECT id, sku, name, price_cents, stock_qty FROM products"
+  session.execute(text(f"{base} WHERE name LIKE '%{q}%'"))  # not flagged
+  ```
+
+- **Why:** `S608` matches on the literal text of the string expression being interpolated.
+  No dataflow. The f-string above contains no SQL keyword, so moving `SELECT` one line up
+  into a variable makes the rule blind — while `ORDER BY {column}` *is* flagged, because
+  `SELECT` is still in the same literal.
+- **Why this is the bad case:** it is not an exotic evasion. Building a base query and
+  appending optional clauses is the ordinary way an endpoint with filters is written, so
+  the pattern SAST misses is the pattern a growing codebase drifts into.
+- **Refines F-02 and F-05 a third time.** F-02 predicted ruff would catch step 2's SQLi; it
+  did (see F-11). F-05 narrowed the rule to four statement keywords. F-08 narrows it again:
+  the keyword must appear *in the same string expression as the interpolation*. A clean
+  `S608` run means "no interpolation next to a SQL keyword", which is a much weaker claim
+  than "no SQL injection".
+- **Tests:** `tests/attacks/test_sqli.py::test_the_search_endpoint_no_longer_builds_sql_strings`
+  asserts the absence over the AST and token stream rather than by substring search — a
+  first attempt grepped the source and matched the module's own docstring discussing
+  `text()`.
+
+### F-09 · FK enforcement blocked PK reassignment, but only by accident
+- **Severity:** Informational · **Category:** AppSec / control attribution
+- **Attacked:** `PATCH /products/{id}` with `{"id": 9999}` against the vulnerable step-2
+  code, on two products: one referenced by an order item, one not.
+- **Finding:** the **referenced** product's update failed with `FOREIGN KEY constraint
+  failed` (step 1's `ON DELETE RESTRICT` plus the pragma from F-03). The **unreferenced**
+  product's primary key was reassigned without complaint.
+- **Why it is not mitigation:**
+  1. The API accepted the field and issued the `UPDATE`. The application-layer flaw was
+     entirely present; the database caught the consequence.
+  2. Coverage was "products that happen to have been ordered". *Has this row been
+     referenced yet* is not a security boundary.
+  3. It surfaced as an unhandled 500, not a 4xx.
+- **Worth recording because** a half-passing exploit is the easiest kind of finding to
+  misread as a control working. The planned exploit "partly failed", and the reason was a
+  control from a different step firing for a reason nobody designed.
+- **Now:** both cases return an identical 422 from the schema. Pinned by
+  `test_referenced_product_is_now_protected_by_the_schema_not_the_database`, which asserts
+  the two statuses are *equal* — so the outcome no longer depends on order history.
+
+### F-10 · Mass assignment: clients wrote every server-owned field
+- **Severity:** High · **Category:** AppSec · **OWASP:** MCP05 (MCP07 is the sharper fit)
+- **Attacked:** one Pydantic model per entity used for input and output, spread into the
+  ORM with `**payload.model_dump()`.
+- **Findings, all confirmed by request:**
+  | Payload | Result |
+  |---|---|
+  | `PATCH /products/1 {"id": 9999}` | primary key reassigned |
+  | `POST /orders {"status": "shipped", "total_cents": 0}` | order created shipped and free |
+  | `POST /orders {... "unit_price_cents": 1}` | 4950c product bought for 1c |
+  | `PATCH /orders/1 {"total_cents": 0}` | existing order zeroed |
+  | `PATCH /orders/1 {"status": "shipped"}` | draft → shipped, skipping placed and paid |
+  | `PATCH /products/1 {"stok_qty": 0}` | **200, and nothing changed** |
+- **The last row is the quiet one.** Pydantic v2 defaults to `extra="ignore"`, so a typo in
+  a security-relevant field is a silent success. The caller is told it worked.
+- **Control:** direction-specific models in `schemas.py` (`*Create` / `*Update` / `*Read`)
+  where server-owned fields are **absent**, `extra="forbid"` on every input model via a
+  shared `STRICT_INPUT`, and `total_cents` / `unit_price_cents` computed in the handler from
+  the product row. `status` has no writable field at all: `PATCH /orders/{id}` was removed
+  in favour of `POST /orders/{id}/status` gated by an explicit `ALLOWED_TRANSITIONS` table,
+  because a field can express "a value from this enum" but not "draft may become placed but
+  not shipped".
+- **Verified by removal:** emptying `STRICT_INPUT` fails exactly 5 attack tests; bypassing
+  the transition check fails exactly 2. No happy-path test fails in either case, so the
+  controls reject only what they should.
+- **Tests:** `tests/attacks/test_mass_assignment.py` (10)
+
+### F-11 · SQL injection in the product search
+- **Severity:** Critical · **Category:** AppSec · **OWASP:** MCP05
+- **Attacked:** `GET /products/search?q=` built as
+  `f"SELECT * FROM products WHERE name LIKE '%{q}%'"`.
+- **Findings:**
+  - `' UNION SELECT id, email, role, 0, 0 FROM users --` returned every user's email **and
+    role**, serialised as products. UNION result columns are named by the first select, so
+    emails arrived as `sku` and roles as `name`, and the response model accepted them —
+    it constrains types, not provenance.
+  - `' OR 1=1 --` returned the whole catalogue.
+  - `' UNION SELECT 0, name, sql, 0, 0 FROM sqlite_master WHERE type='table' --` returned
+    every table name and its DDL, turning blind injection into targeted injection.
+  - A bare `'` raised an unhandled `OperationalError`, **and SQLAlchemy embeds the failed
+    statement in the exception message**: `[SQL: SELECT * FROM products WHERE name LIKE
+    '%'%']`. Any handler that echoes exception detail, or any log shipped somewhere less
+    trusted than the database, hands over the column count rather than making an attacker
+    guess it.
+- **Control:** the endpoint is now an ORM `select()` with
+  `Product.name.contains(q, autoescape=True)`. Parameterising the `text()` query would have
+  stopped the injection; removing the string-building removes the shape of the bug, which
+  is why that was preferred. Ruff flagged this one (`S608`) — confirming F-02's prediction —
+  but see F-08 for what it would not have flagged.
+- **Tests:** `tests/attacks/test_sqli.py` (7)
+
+### F-12 · Bound parameters do not escape LIKE wildcards
+- **Severity:** Low · **Category:** AppSec
+- **Finding:** parameterisation stops injection but `%` and `_` remain LIKE metacharacters
+  *inside* a bound value. A correctly parameterised `name LIKE :pattern` with `q="%"` still
+  returns the entire catalogue, and `q="W_dget"` still matches `Widget`.
+- **Why it matters:** this is not SQL injection, but it is the same end state as the `' OR
+  1=1 --` tautology — a filter switched off by its own input. An endpoint that paginates on
+  the assumption the filter narrows results is then trivially made to scan everything.
+- **Control:** `.contains(q, autoescape=True)`.
+- **Verified by removal:** dropping `autoescape=True` fails exactly one test,
+  `test_like_wildcards_in_the_search_term_are_escaped`, and nothing else — so no other test
+  was silently depending on it.
+
+### F-13 · "Field absent" and `extra="forbid"` are two different controls
+- **Severity:** Informational · **Category:** AppSec / control attribution
+- **Attacked:** removed `extra="forbid"` from every input model and replayed
+  `PATCH /products/{id}` with `{"id": 9999, "price_cents": 7}`.
+- **Finding:** **the primary key did not move.** The response was 200, `price_cents` was
+  applied, and `id` was dropped before the handler ever saw it, because `id` is not a field
+  on `ProductUpdate` at all.
+- **So the two controls do different jobs:**
+  - **Field absence** prevents the write. This is the real control against mass assignment.
+  - **`extra="forbid"`** prevents the *silence*. Without it the attempt is a 200 that looks
+    like success.
+- **Why worth a ledger entry:** the obvious reading of the inverted exploit test — it
+  expects 422, 422 comes from `extra="forbid"` — credits the wrong control for the property
+  that actually matters. Both are needed, for different reasons, and a future refactor that
+  keeps one while dropping the other has not kept "the" fix.
+- **Tests:** `test_input_schemas_do_not_expose_server_owned_fields` asserts the absence
+  directly against the OpenAPI document, so re-adding `status` to `OrderCreate` fails
+  immediately even if no exploit test covers that field.
 
 ## Phase 2 — Identity
 *(steps 3–6)*
@@ -204,3 +343,10 @@ actually stopped it?* Controls that stopped nothing get recorded too.
 | F-04 | Writing `'root'` / `'admin '` / 64 chars into `users.role` | `create_constraint=True` CHECK, plus ORM `validate_strings` | `VARCHAR(8)` — SQLite ignores length; `Enum(Role)` alone — emits no constraint |
 | F-05 | Interpolated `PRAGMA` / `ATTACH DATABASE` | hand-written `_READABLE_PRAGMAS` allowlist | ruff `S608` — matches only SELECT/INSERT/UPDATE/DELETE |
 | F-07 | Migrations running without FK enforcement | `env.py` using `create_db_engine` | Alembic's generated `env.py` |
+| F-08 | Interpolated SQL with the `SELECT` held in a separate variable | nothing — ruff `S608` does not flag it | ruff `S608`; 7 of 8 other interpolation shapes *were* flagged |
+| F-09 | `PATCH /products/{id}` reassigning a primary key (pre-fix) | `PRAGMA foreign_keys` — for referenced rows only, as a 500 | nothing else; unreferenced products were reassigned freely |
+| F-10 | Writing `id` / `status` / `total_cents` / `unit_price_cents` from a request | fields **absent** from the input models (the write), `extra="forbid"` (the silence), server-side pricing, `ALLOWED_TRANSITIONS` | a shared input/output model; `extra="ignore"` — turns a typo into a silent 200 |
+| F-10 | draft → shipped in one PATCH | removing the writable `status` field and the `PATCH /orders/{id}` route | enum validation — `shipped` is a valid value, just not a valid *transition* |
+| F-11 | `UNION SELECT` exfiltrating `users.email` + `role`; `sqlite_master` recon; error-message oracle | ORM `select()` with no SQL string | the `ProductRead` response model — constrains types, not provenance |
+| F-12 | `q="%"` returning the whole catalogue through a *parameterised* LIKE | `.contains(autoescape=True)` | bound parameters — stop injection, not wildcards |
+| F-13 | `{"id": 9999}` with `extra="forbid"` removed | field absence from `ProductUpdate` — the write never happened | `extra="forbid"` — governs the 422, not the write |

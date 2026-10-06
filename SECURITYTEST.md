@@ -74,7 +74,7 @@ working" index — if a step lands and its rule never fired, check why.
 
 | Rule | Name | Expected at |
 |---|---|---|
-| `S608` | hardcoded-sql-expression | Step 2 — SQL injection in product search. **Narrower than it looks:** matches only SELECT/INSERT/UPDATE/DELETE (see §4) |
+| `S608` | hardcoded-sql-expression | **Confirmed step 2** — fired on the product-search f-string. **Narrower than it looks:** the statement keyword must sit in the *same string expression* as the interpolation (see §4) |
 | `S105` `S106` `S107` | hardcoded-password string / arg / default | **Confirmed step 0.** Step 3 AS secrets |
 | `S104` | hardcoded-bind-all-interfaces | Step 8 — binding `rlmcp` to `0.0.0.0` |
 | `S311` | suspicious-non-cryptographic-random | Step 12 — state handles built with `random` |
@@ -175,10 +175,37 @@ statement keywords it recognises inside an f-string:
 parameters) and ruff reported nothing, so its `_READABLE_PRAGMAS` allowlist is a control
 **no linter will ever remind us to keep**. Recorded as `THREAT_MODEL.md` F-05.
 
-Take-away for the rest of the project: do not read a clean `--select S` run as "no
-injection". Read it as "no injection in the four statement shapes ruff knows".
+**Confirmed again at step 2 — the keyword must be in the same string expression.**
+Eight injectable spellings of the *same* product search, ruff 0.16.9:
 
-Ruff is still expected to catch step 2's SQL injection, and **none** of these:
+| How the query is built | Flagged? |
+|---|---|
+| `sql = f"SELECT ... LIKE '%{q}%'"`, then `text(sql)` | yes |
+| `text(f"SELECT ... LIKE '%{q}%'")` inline | yes |
+| `text("SELECT ... LIKE '%" + q + "%'")` | yes |
+| `text("SELECT ... '%{}%'".format(q))` | yes |
+| `text("SELECT ... '%%%s%%'" % q)` | yes |
+| `text(f"SELECT * FROM products ORDER BY {column}")` | yes |
+| `text("SELECT ... WHERE " + " AND ".join([..., f"name LIKE '%{q}%'"]))` | yes |
+| `base = "SELECT ... FROM products"`; `text(f"{base} WHERE name LIKE '%{q}%'")` | **no** |
+
+Seven of eight. The miss is the one that matters: `S608` matches the literal text of the
+string being interpolated and does no dataflow, so holding the `SELECT` in a variable one
+line up makes it blind — while `ORDER BY {column}` *is* flagged, because `SELECT` is still
+in the same literal. That is not an exotic evasion; a base query plus appended optional
+clauses is how a filterable endpoint is ordinarily written. Recorded as F-08.
+
+Reproduce it: the eight-variant probe is reconstructible from the F-08 table, and
+`--select S608 --isolated` over a scratch file is the whole method.
+
+Take-away for the rest of the project: do not read a clean `--select S` run as "no
+injection". Read it as "no injection where ruff can see a SQL keyword next to an
+interpolation".
+
+**Step 2's scorecard: two vulnerabilities, SAST found one.** It flagged the SQL injection
+(F-11) and said nothing whatsoever about the mass assignment (F-10) — no rule covers
+"this Pydantic model lets a client write a field the server owns". Ruff caught none of
+these either:
 
 - **Step 4** — audience validation gap. `jwt.decode(token, key)` without `audience=` is a
   syntactically correct API call.
@@ -206,13 +233,22 @@ uv run pytest -m "attack and mcp02"
 uv run pytest                        # everything
 ```
 
-Current counts (step 1): **61 tests, 22 marked `attack`.** Breakdown:
+Current counts (step 2): **91 tests, 39 marked `attack`.** Breakdown:
+
+Note the two numbers are easy to confuse: `pytest tests/attacks/ -q` reports **54**,
+because the step-1 modules also hold tests asserting SQLite's *unhardened* defaults,
+which are not themselves exploits and carry no `attack` marker. `pytest -m attack` is
+the number that means "exploits".
+
 
 | Module | Covers | `THREAT_MODEL.md` |
 |---|---|---|
 | `attacks/test_fk_enforcement.py` | SQLite FK enforcement off by default; pragma no-op in a transaction; per-connection scope | F-03 |
 | `attacks/test_role_column_integrity.py` | `users.role` accepting arbitrary values; enum stored as name vs value | F-04 |
 | `unit/test_models.py` | CHECK-constraint backstops for negative money/quantities | F-03/F-04 support |
+| `attacks/test_mass_assignment.py` | client writing `id` / `status` / `total_cents` / `unit_price_cents`; unknown fields silently ignored; status skipping the workflow | F-09, F-10, F-13 |
+| `attacks/test_sqli.py` | `UNION SELECT` exfiltration, `sqlite_master` recon, error-message oracle, LIKE-wildcard abuse, absence of raw SQL | F-08, F-11, F-12 |
+| `integration/test_crud.py` | the endpoints still working — the half that catches a "fix" which rejects everything | — |
 | `unit/test_migrations.py` | migration/model drift, reversibility, no pinned DB URL | F-06, F-07 |
 
 ### Proving a control is load-bearing
@@ -233,6 +269,32 @@ that, both used at step 1:
    At step 1 this produced exactly `5 failed, 9 passed` — the 5 asserting hardened
    behaviour, with the 9 asserting SQLite's *defaults* correctly unaffected. If removing a
    control does not break anything, the control is untested.
+
+**Step 2's three measurements**, each by editing one thing and running the whole suite
+(90 tests at the time):
+
+| Control removed | How | Result |
+|---|---|---|
+| `extra="forbid"` | `STRICT_INPUT = ConfigDict()` in `schemas.py` | `5 failed, 85 passed` |
+| LIKE escaping | drop `autoescape=True` from `.contains()` | `1 failed, 89 passed` |
+| Status transition table | replace the guard with `if False:` | `2 failed, 88 passed` |
+
+**No happy-path test failed in any of the three**, which is the half of the measurement
+that is easy to skip: it shows each control rejects only what it should, rather than
+passing its exploit test by being broadly restrictive.
+
+**One removal was more informative than the test it broke.** Emptying `STRICT_INPUT` fails
+`test_product_id_is_not_an_accepted_input_field`, which reads as "`extra="forbid"` stops
+primary-key reassignment". It does not. Replaying the request with the control gone shows a
+**200 and the primary key unmoved** — `id` is not a field on `ProductUpdate`, so Pydantic
+drops it before the handler runs. Field *absence* prevents the write; `extra="forbid"`
+prevents the silent 200. Two controls, two different jobs, one test that looked like it
+covered both. Recorded as F-13, and now pinned separately by
+`test_input_schemas_do_not_expose_server_owned_fields`, which asserts against the OpenAPI
+document instead of a payload.
+
+The general lesson for later steps: when a removal makes a test fail, confirm the
+vulnerability is actually back, not just that the assertion is unhappy.
 
 Markers are declared in `pyproject.toml` (`mcp01`–`mcp10`, plus `attack`). Conventions and
 the per-module header format are in [tests/attacks/README.md](tests/attacks/README.md).

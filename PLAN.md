@@ -14,19 +14,26 @@ regression test.
 
 ## 0. Where we are
 
-**Last worked: 2026-09-30.** Steps 0 and 1 complete. **Next: step 2** (CRUD endpoints and
-input validation).
+**Last worked: 2026-10-05.** Steps 0, 1 and 2 complete. **Next: step 3** (local
+authorization server) — the first step of Phase 2.
 
-To resume: read this section, then step 2 below. Sanity check first —
+To resume: read this section, then step 3 below. Sanity check first —
 
 ```bash
-uv run pytest -q          # 61 passed (22 marked `attack`)
-uv run mypy               # Success: no issues found in 16 source files
-uv run ruff check .       # All checks passed
+uv run pytest -q           # 91 passed
+uv run pytest -m attack -q # 39 passed, 52 deselected
+uv run mypy                # Success: no issues found in 24 source files
+uv run ruff check .        # All checks passed
+uv run ruff format --check .   # 24 files already formatted
 ```
 
-Findings so far are in `THREAT_MODEL.md` F-01 … F-07; how to run the security checks is in
-`SECURITYTEST.md`. Commits: `d168708` `cfc5318` `7634dc4` `ee21257`.
+`ruff format --check` is in that list because step 2 hit it: `ruff check` passes on code
+`ruff format` would rewrite, and pre-commit runs the formatter, so a commit fails after the
+other three are green. Run all four.
+
+Findings so far are in `THREAT_MODEL.md` F-01 … F-13; how to run the security checks is in
+`SECURITYTEST.md`. Commits: `d168708` `cfc5318` `7634dc4` `ee21257` `3a062b5` (step 2
+break) and the step 2 fix.
 
 ### Local development
 
@@ -38,8 +45,33 @@ RLAPI_DATABASE_URL="sqlite:///$PWD/../../rlapi-dev.db" uv run alembic upgrade he
 ```
 
 That gives an empty schema. Seed rows (5 users one per role, 4 products, 3 orders across
-two customers) were created with a one-off inline script this session — there is no
-reusable seed script yet, see open items.
+two customers) were created with a one-off inline script in the step-1 session — there is
+still no reusable seed script, see open items.
+
+**Running the API** (added step 2):
+
+```bash
+RLAPI_DATABASE_URL="sqlite:///$PWD/rlapi-dev.db" \
+  uv run uvicorn --factory rlapi.app:asgi_app_from_env --reload
+```
+
+Verified at step 2 against a freshly migrated database: `/healthz` returns
+`{"status":"ok"}`, a product POSTs, `PATCH /products/1 {"id":9999,"status":"shipped"}`
+returns a 422 naming both fields, and both the UNION and `%` search payloads return `[]`.
+
+Two entrypoints, for different jobs: **`asgi_app_from_env`** is the uvicorn factory and
+holds its engine for the process lifetime, while **`app_from_env`** is a context manager
+that disposes the engine, for scripts. A context manager cannot be a uvicorn `--factory`,
+since the factory must return the app itself. Interactive docs at `/docs`; `create_app`
+calls `assert_hardened()` at startup, so an unhardened engine fails to boot rather than
+serving corrupting writes.
+
+The tests do **not** use this database, or `:memory:` — each gets a temp file via the
+`engine` fixture in `tests/conftest.py`. That is deliberate: `TestClient` runs the app in
+another thread, and an in-memory SQLite needs `StaticPool`'s single connection, which
+`sqlite3` refuses to share across threads. A file database uses the ordinary pool, so every
+thread opens its own connection and each must be hardened separately — exercising the
+per-connection property F-03 is about instead of relaxing `check_same_thread`.
 
 **Browsing it with DBeaver or any external tool — read this first.** DBeaver is installed
 at `/usr/bin/dbeaver`, and it opens SQLite with `foreign_keys = 0`. Writes made there
@@ -62,17 +94,37 @@ writes until `busy_timeout` (5s) expires.
 
 | # | Question | Current state |
 |---|---|---|
-| 1 | Reusable `scripts/seed_dev_db.py`? | Not written. Worth doing once step 2 starts changing the schema and step 5 needs specific role/ownership fixtures. |
+| 1 | Reusable `scripts/seed_dev_db.py`? | Still not written, and now more clearly worth it: `tests/conftest.py` has a `seeded` fixture (one user per role, 2 products, 1 order) that a script could share. Step 5 needs specific role/ownership fixtures. |
 | 2 | Should `create_db_engine` get an `enforce_foreign_keys=False` flag for experimentation? | **No flag**, deliberately — the attack suite builds its own unhardened engine so the shipped API cannot be misconfigured. Raised for dissent; unanswered, current choice stands. Step 8's `validate_token_resource` is the same decision. |
 | 3 | Narrow the `tests/**` SAST exemptions to `tests/attacks/**` only? | Not done. Currently `S101`/`S105`/`S106`/`S311` are exempt across all of `tests/`, making the exploit code the least-scanned code in the repo (`SECURITYTEST.md` gotcha 2). |
 | 4 | Container runtime | **None installed** — no docker, podman, compose or nerdctl. Hard prerequisite for steps 17–18 (Keycloak, container hardening). Leaning podman for rootless-by-default. No urgency until step 17. |
 | 5 | Go toolchain / gitleaks | Decided against. gitleaks ships static binaries so Go is never needed; its marginal value here is low (`THREAT_MODEL.md` F-01). |
+| 6 | No `IntegrityError` handler, so a duplicate SKU is a 500 | Raised at step 2 and left as-is, pinned by `test_duplicate_sku_is_rejected` asserting the 500 rather than hiding it. A 409 needs an exception handler; step 6 adds one anyway when audit logging needs to catch failed writes. Worth doing then, not before. |
+| 7 | `OrderCreate.customer_id` comes from the request | Any caller can place an order as any customer. That **is** step 5's IDOR and is deliberately left open, not overlooked; `customer_id` becomes the token's `sub`. Flagged here so it is not mistaken for an oversight when reading step 2's code. |
+| 8 | Starlette deprecation warning on every test run | `starlette.testclient` warns that using it with `httpx` is deprecated and wants `httpx2`. Cosmetic today. Worth fixing before step 9, where the attack suite starts asserting on real HTTP behaviour between services and a surprise client-library swap would be badly timed. |
 
-### To check during step 2
+### Checked during step 2 — result
 
-F-05 established that ruff `S608` only matches SELECT/INSERT/UPDATE/DELETE. Step 2 writes a
-deliberate SQL injection in the product search — confirm whether ruff actually flags it, and
-record the result against the F-02 prediction either way.
+**Ruff flagged it.** F-02's prediction holds for the SQLi half, and `RUF100` independently
+confirmed the rule was live by not reporting the `# noqa: S608` as unused. Two caveats that
+are the actually useful part, both now in `THREAT_MODEL.md`:
+
+- **F-08:** the statement keyword must sit in the *same string expression* as the
+  interpolation. Of eight injectable spellings of the same search, seven were flagged; the
+  miss was `f"{base} WHERE name LIKE '%{q}%'"` with the `SELECT` in a variable one line up.
+  No dataflow analysis. That is the ordinary shape of a query with optional filters, so it
+  is the miss that matters.
+- **F-10 was flagged by nothing.** No rule covers "this Pydantic model lets a client write a
+  field the server owns". Step 2's score: two vulnerabilities, SAST found one.
+
+### To check during step 3
+
+The AS signing key is the first real secret in the repo. Step 0's F-01 work established that
+`detect-secrets` and `detect-private-key` catch key *content* in a tracked file while
+`.gitignore` only matches names — so generate the key to a gitignored path and then
+deliberately try to commit it from a tracked `.py`, and confirm which hook actually fires.
+Ruff `S105`/`S106` were confirmed at step 0; `S505` (weak RSA key size) has never fired and
+step 3 is its first real chance.
 
 ---
 
@@ -271,6 +323,45 @@ a 422 rather than silently ignored; server-derived fields (`total_cents`, `statu
 accepted from input; bound parameters everywhere.
 
 **Verify** — `tests/attacks/test_mass_assignment.py`, `tests/attacks/test_sqli.py`.
+
+**Status: done.** 91 tests, 39 marked `attack` (step 2 added 30 and 17). ruff + mypy
+`--strict` clean, zero remaining
+`noqa`. Findings in `THREAT_MODEL.md` F-08 … F-13. Break committed separately as `3a062b5`
+so the exploits have a commit they demonstrably passed against.
+
+**Both planned exploits landed**, and the UNION payload from this step worked verbatim —
+it returned every user's email *and role*, because UNION result columns are named by the
+first select, so they arrived as `sku` and `name` and the response model accepted them. A
+response model constrains types, not provenance.
+
+**What the fix actually consisted of**, in decreasing order of how much work it does:
+1. Server-owned fields **absent** from the input models. Not a check — there is nothing to
+   assign to. This is what stops the write (F-13).
+2. `status` has no writable field at all. `PATCH /orders/{id}` was deleted in favour of
+   `POST /orders/{id}/status` behind an explicit `ALLOWED_TRANSITIONS` table, because a
+   field can express "a value from this enum" but not "draft may become placed but not
+   shipped".
+3. `extra="forbid"` via a shared `STRICT_INPUT`. This stops the *silent* failure, not the
+   write — measured, see F-13.
+4. The search is an ORM `select()`, so there is no SQL string to parameterise.
+
+**Four findings beyond the planned two:**
+1. **ruff `S608` is defeated by splitting the query across two variables** (F-08). Seven of
+   eight injectable shapes flagged; the miss is the most natural one.
+2. **Step 1's FK enforcement blocked PK reassignment — but only for referenced rows**
+   (F-09), as an unhandled 500. An incidental control, and a reminder that a half-failing
+   exploit is the easiest kind of result to misread as a control working.
+3. **Bound parameters do not escape LIKE wildcards** (F-12). A correctly parameterised
+   query with `q="%"` still returns everything, which is the tautology attack by another
+   route. `.contains(autoescape=True)` is the fix.
+4. **"Field absent" and `extra="forbid"` are two different controls** (F-13), discovered by
+   removing one and finding the vulnerability did *not* come back. The inverted exploit
+   test credits the wrong one if read naively.
+
+**Method note worth carrying forward:** removing a control and watching the right tests fail
+is necessary but not sufficient — F-13 came from asking whether the *vulnerability* was back,
+not just whether the assertion was unhappy. The three removal measurements are tabulated in
+`SECURITYTEST.md` §5.
 
 → **MCP05** · **CHECKPOINT**
 
@@ -767,7 +858,7 @@ these, the answer is "authorization", not "input filtering".
 | MCP02 | Privilege escalation via scope creep | 5, 9, 10 | Minimal `scopes_supported` + per-operation step-up + downscoped exchange |
 | MCP03 | Tool poisoning | 11, 15 | Strict schemas; deterministic `tools/list`; annotations treated as hints only |
 | MCP04 | Supply chain & dependency tampering | 0, 17 | Locked hash-pinned deps; advisory gate; SBOM |
-| MCP05 | Command injection & execution | 2, 11 | Bound parameters; `extra="forbid"`; no shell |
+| MCP05 | Command injection & execution | 2, 11 | No SQL strings at all (step 2: ORM `select()`, not parameterised `text()`); server-owned fields **absent** from input models; `extra="forbid"` for the silence; no shell |
 | MCP06 | Intent flow subversion | 13, 15 | Untrusted-data fencing + signed `requestState`; **authorization as the real gate** |
 | MCP07 | Insufficient authN/authZ | 4, 5, 8, 9, 12, 13, 14 | Audience validation; two independent PDPs; handle binding |
 | MCP08 | Lack of audit & telemetry | 6, 16 | Decision logging; OTel trace context via `_meta` |
