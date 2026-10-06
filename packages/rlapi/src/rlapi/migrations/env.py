@@ -20,7 +20,6 @@ CHECK or FK can silently go missing -- verify the resulting schema, do not
 assume it.
 """
 
-import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -28,6 +27,8 @@ from sqlalchemy import Connection
 
 from rlapi.db import create_db_engine
 from rlapi.models import Base
+from rlapi.settings import DEFAULT_DATABASE_URL
+from rlapi.settings import database_url as database_url_from_env
 
 config = context.config
 
@@ -36,16 +37,18 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-DEFAULT_DATABASE_URL = "sqlite:///rlapi.db"
-DATABASE_URL_ENV_VAR = "RLAPI_DATABASE_URL"
-
 
 def database_url() -> str:
-    """Resolve the target database, environment first."""
-    from_env = os.environ.get(DATABASE_URL_ENV_VAR)
-    if from_env:
-        return from_env
-    return config.get_main_option("sqlalchemy.url") or DEFAULT_DATABASE_URL
+    """Resolve the target database: environment, then `alembic.ini`, then default.
+
+    Shares `rlapi.settings` with the application as of step 2. Two definitions
+    of "where is the database" is one too many -- if the migration runner and
+    the app disagree, migrations harden and version a database that nobody is
+    serving, and the discrepancy shows up as a schema error much later.
+    """
+    return database_url_from_env(
+        default=config.get_main_option("sqlalchemy.url") or DEFAULT_DATABASE_URL
+    )
 
 
 def run_migrations_offline() -> None:

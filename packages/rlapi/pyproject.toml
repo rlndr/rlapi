@@ -5,6 +5,7 @@ description = "CRUD API over inventory and orders; an OAuth 2.1 resource server.
 requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.14",
+    "fastapi>=0.115",
     "sqlalchemy>=2.0",
 ]
 
