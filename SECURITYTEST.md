@@ -312,6 +312,23 @@ uv sync --locked                                  # verify lockfile is authorita
 `pip-audit` is already a dev dependency. Note it answers a different question from ruff:
 ruff reads our code, `pip-audit` reads everyone else's.
 
+**Known blind spot — browser assets (see `THREAT_MODEL.md` F-14).** More precisely,
+`pip-audit` reads everyone else's *Python*. `/docs` and `/redoc` pull Swagger UI and ReDoc
+from `cdn.jsdelivr.net` at page-view time, on floating major-version ranges and with no
+subresource-integrity hash. Nothing in `uv.lock` or `pip-audit` covers them. Checking that
+is a grep, not a scan, and needs the server running:
+
+```bash
+curl -s http://127.0.0.1:8000/docs | grep -oE 'https://[^"]+'   # external origins
+curl -s http://127.0.0.1:8000/docs | grep -c 'integrity='        # 0 == no SRI
+```
+
+Run at step 2: two jsdelivr URLs plus a `fastapi.tiangolo.com` favicon, and `0` for SRI
+(ReDoc's bundle is a third, served on `/redoc` rather than `/docs`).
+`swagger-ui-dist@5` resolved to 5.33.1 and `redoc@2` to 2.5.4 — neither pinned here, so
+both can move without a commit. Re-run this after any FastAPI upgrade, and expect the
+output to change to "no external origins" once F-14 is fixed.
+
 ### Type checking as a security control
 
 ```bash

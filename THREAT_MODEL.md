@@ -312,6 +312,69 @@ name-based rule never would.
   directly against the OpenAPI document, so re-adding `status` to `OrderCreate` fails
   immediately even if no exploit test covers that field.
 
+### F-14 · `/docs` loads Swagger UI from a third-party CDN, unpinned and unverified
+- **Severity:** Low today · High from step 4 · **Category:** Supply chain (MCP04) / AppSec
+- **Found:** by reading the bytes `/docs` actually returns, rather than the page it draws.
+  Not an attack — an inventory gap, which is why it surfaced during documentation work and
+  not from the attack suite.
+
+**Nothing in this repo renders the API documentation.** The `/docs` response is a ~30-line
+HTML shell; the rendering is done by JavaScript fetched from a public CDN at page-view time:
+
+| Asset | URL in the served HTML | Resolved to, when checked |
+|---|---|---|
+| Swagger UI JS | `cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js` | 5.33.1 |
+| Swagger UI CSS | `cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css` | 5.33.1 |
+| ReDoc JS (`/redoc`) | `cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js` | 2.5.4 |
+| favicon | `fastapi.tiangolo.com/img/favicon.png` | — |
+
+These are FastAPI's **default argument values**, not choices made here — see
+`fastapi/openapi/docs.py` lines 79, 92 and 236 in the installed 0.142.2. `create_app` never
+mentions them, which is exactly why they are easy to miss.
+
+**What is wrong with it:**
+
+- **The version floats.** `@5` is a major-version *range*, not a pin. jsdelivr answered
+  `x-jsd-version: 5.33.1` with `cache-control: max-age=604800`, so the code executing in a
+  browser can change — within 5.x, at the CDN's discretion — with no commit here, no
+  lockfile diff, and nothing to review. Same for `redoc@2`.
+- **No integrity check.** Grepping the served HTML for `integrity=` returns **0**. With no
+  subresource-integrity hash the browser cannot detect substituted content, so the floating
+  range and a CDN compromise are the same event from our side.
+- **Invisible to this project's tooling.** `uv.lock` pins the Python tree and `pip-audit`
+  reads the installed tree; neither knows these two files exist. §6 of `SECURITYTEST.md`
+  says *"ruff reads our code, `pip-audit` reads everyone else's"* — the honest version is
+  that `pip-audit` reads everyone else's **Python**. Browser assets referenced by a
+  server-rendered page fall between both tools.
+- **It is also an availability dependency.** Offline or with the CDN blocked, `/docs` is a
+  blank shell. Confirmed: the HTML loads, the page renders nothing.
+
+**Why the severity rises at step 4.** Today `/docs` is unauthenticated, the API has no auth
+at all, and uvicorn binds `127.0.0.1` — third-party JS on that page can reach a local API
+holding four dev orders, so the blast radius is close to nil. From step 4 the same page
+becomes a credential-bearing surface: *Try it out* sends real bearer tokens, and
+`swagger_ui_init_oauth` (FastAPI's `init_oauth`) puts OAuth client configuration into the
+document itself. Arbitrary, unverified, silently-updating third-party script then shares an
+origin with a page that holds tokens — MCP01 (Token Mismanagement) as much as MCP04. The
+control must therefore land **before** step 4 wires auth into the docs page, not after.
+
+- **Control:** *none yet — recorded, not fixed.* The fix is `docs_url=None` / `redoc_url=None`
+  plus a local route calling `get_swagger_ui_html(swagger_js_url=..., swagger_css_url=...)`
+  against self-hosted assets. Pinning to an exact version (`@5.33.1`) is strictly better than
+  `@5` but keeps both the third-party origin and the availability dependency, so it is a
+  stopgap, not the fix.
+- **Residual risk after self-hosting:** the assets become *our* supply chain — vendored
+  files age out of security updates, and nothing in `pip-audit` will mention them either.
+  Whoever self-hosts owns a refresh cadence.
+- **Worth noting about blame.** This is a framework default doing something reasonable for a
+  getting-started experience and wrong for a resource server. No linter flagged it, no test
+  covers it, and `/docs` worked perfectly throughout step 2 — the failure mode of a default
+  is that it never asks to be reviewed.
+- **Status:** open. Revisit at **step 4** (before `/docs` carries tokens) and **step 17**
+  (dependency scanning).
+- **Tests:** none yet. The cheap one needs no network: assert the `/docs` HTML references no
+  external origin. It *fails today*, so it belongs with the fix rather than before it.
+
 ## Phase 2 — Identity
 *(steps 3–6)*
 
@@ -350,3 +413,4 @@ actually stopped it?* Controls that stopped nothing get recorded too.
 | F-11 | `UNION SELECT` exfiltrating `users.email` + `role`; `sqlite_master` recon; error-message oracle | ORM `select()` with no SQL string | the `ProductRead` response model — constrains types, not provenance |
 | F-12 | `q="%"` returning the whole catalogue through a *parameterised* LIKE | `.contains(autoescape=True)` | bound parameters — stop injection, not wildcards |
 | F-13 | `{"id": 9999}` with `extra="forbid"` removed | field absence from `ProductUpdate` — the write never happened | `extra="forbid"` — governs the 422, not the write |
+| F-14 | Third-party JS executing on `/docs`, unpinned and unhashed | nothing — recorded, unfixed | `uv.lock` and `pip-audit` — neither sees browser assets; SRI absent, so the browser cannot check either |
