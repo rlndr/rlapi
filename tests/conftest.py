@@ -34,6 +34,9 @@ from rlapi.app import create_app
 from rlapi.db import create_db_engine, create_session_factory
 from rlapi.models import Base, Order, OrderItem, Product, Role, User
 
+#: `rlas` fixtures live in their own module; see its docstring.
+pytest_plugins = ["tests.as_fixtures"]
+
 
 @pytest.fixture
 def engine(tmp_path: Path) -> Iterator[Engine]:

@@ -3,7 +3,14 @@ name = "rlas"
 version = "0.0.0"
 description = "Local OAuth 2.1 authorization server (retired in step 18 for Keycloak)."
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "cryptography>=50.0.2",
+    "fastapi>=0.142.2",
+    "httpx>=0.28.1",
+    "pyjwt[crypto]>=2.15.1",
+    "python-multipart>=0.0.32",
+    "uvicorn>=0.54.0",
+]
 
 [build-system]
 requires = ["hatchling"]
