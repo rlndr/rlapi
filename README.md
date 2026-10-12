@@ -103,10 +103,10 @@ uv run pytest -q              # 91 passed
 uv run pytest -m attack -q    # 39 passed, 52 deselected
 uv run mypy                   # Success: no issues found in 24 source files
 uv run ruff check .           # All checks passed
-uv run ruff format --check .  # 29 files already formatted
+uv run ruff format --check .  # 30 files (24 .py + 6 .md)
 ```
 
-Those counts are current as of 2026-10-11. The attack suite is the interesting one: each
+Those counts are current as of 2026-10-12. The attack suite is the interesting one: each
 test proves a specific vulnerability and must **fail to exploit** against fixed code.
 
 Security tooling has its own runbook — **[SECURITYTEST.md](SECURITYTEST.md)** — with the

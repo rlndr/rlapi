@@ -24,14 +24,18 @@ uv run pytest -q           # 91 passed
 uv run pytest -m attack -q # 39 passed, 52 deselected
 uv run mypy                # Success: no issues found in 24 source files
 uv run ruff check .        # All checks passed
-uv run ruff format --check .   # 24 files already formatted
+uv run ruff format --check .   # 30 files already formatted
 ```
+
+The format count is 24 `.py` **plus the 6 `.md` files**: ruff 0.16 formats Python code
+blocks inside Markdown, so the formatter (and the pre-commit hook) now rewrites code fences
+in these docs too. It read 24 before that was noticed on 2026-10-12.
 
 `ruff format --check` is in that list because step 2 hit it: `ruff check` passes on code
 `ruff format` would rewrite, and pre-commit runs the formatter, so a commit fails after the
 other three are green. Run all four.
 
-Findings so far are in `THREAT_MODEL.md` F-01 … F-13; how to run the security checks is in
+Findings so far are in `THREAT_MODEL.md` F-01 … F-14 (F-14, the `/docs` CDN assets, is open); how to run the security checks is in
 `SECURITYTEST.md`. Commits: `d168708` `cfc5318` `7634dc4` `ee21257` `3a062b5` (step 2
 break) `2fd5138` (step 2 fix).
 
@@ -103,7 +107,7 @@ writes until `busy_timeout` (5s) expires.
 |---|---|---|
 | 1 | Reusable `scripts/seed_dev_db.py`? | Still not written, and now more clearly worth it: `tests/conftest.py` has a `seeded` fixture (one user per role, 2 products, 1 order) that a script could share. Step 5 needs specific role/ownership fixtures. |
 | 2 | Should `create_db_engine` get an `enforce_foreign_keys=False` flag for experimentation? | **No flag**, deliberately — the attack suite builds its own unhardened engine so the shipped API cannot be misconfigured. Raised for dissent; unanswered, current choice stands. Step 8's `validate_token_resource` is the same decision. |
-| 3 | Narrow the `tests/**` SAST exemptions to `tests/attacks/**` only? | Not done. Currently `S101`/`S105`/`S106`/`S311` are exempt across all of `tests/`, making the exploit code the least-scanned code in the repo (`SECURITYTEST.md` gotcha 2). |
+| 3 | Narrow the `tests/**` SAST exemptions? | **Done 2026-10-12, before step 3.** Measured first: `S105`/`S106`/`S311` had zero hits anywhere in `tests/`, so they were dropped from `tests/**` outright rather than narrowed to `tests/attacks/**`. Only `S101` + `ANN` remain exempt. Fake credentials now take a per-line `# noqa: S105  -- fake credential, <why>`. Detail and the probe table in `SECURITYTEST.md` gotcha 2. |
 | 4 | Container runtime | **None installed** — no docker, podman, compose or nerdctl. Hard prerequisite for steps 17–18 (Keycloak, container hardening). Leaning podman for rootless-by-default. No urgency until step 17. |
 | 5 | Go toolchain / gitleaks | Decided against. gitleaks ships static binaries so Go is never needed; its marginal value here is low (`THREAT_MODEL.md` F-01). |
 | 6 | No `IntegrityError` handler, so a duplicate SKU is a 500 | Raised at step 2 and left as-is, pinned by `test_duplicate_sku_is_rejected` asserting the 500 rather than hiding it. A 409 needs an exception handler; step 6 adds one anyway when audit logging needs to catch failed writes. Worth doing then, not before. |

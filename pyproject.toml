@@ -68,13 +68,16 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Attack scripts assert, hardcode fake credentials, and build hostile input.
-# That is their job.
+# pytest is built on `assert`, so S101 has to go everywhere under tests/.
+#
+# S105/S106/S311 deliberately do NOT. Until step 3 they were exempt across all
+# of tests/ while suppressing nothing -- zero hits, measured -- i.e. a standing
+# pass for credentials and `random`-built tokens not yet written. A test that
+# genuinely needs a fake secret says so on the line:
+#     `# noqa: S105  -- fake credential, <why>`
+# which shows up in the diff, and RUF100 reports it once it stops being needed.
 "tests/**" = [
     "S101", # assert
-    "S105", # hardcoded password string
-    "S106", # hardcoded password argument
-    "S311", # non-cryptographic random
     "ANN",  # annotations optional in tests
 ]
 # Alembic writes these. Hand-wrapping generated `sa.Column(...)` lines creates

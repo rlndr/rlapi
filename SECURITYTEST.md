@@ -86,7 +86,7 @@ working" index — if a step lands and its rule never fired, check why.
 | `S110` `S112` | try-except-pass / -continue | Anywhere a failed authz check gets swallowed |
 | `S602`–`S607` | subprocess / shell | Step 11, if any tool ever shells out |
 
-`S101` (assert) matters only in that it is exempted under `tests/**`.
+`S101` (assert) matters only in that it is exempted under `tests/**` — the only `S` rule that is (gotcha 2).
 
 ## 3. Gotchas
 
@@ -118,22 +118,56 @@ rather than losing one — but it means a suppression you believe is active may 
 `--ignore-noqa` is how you check: on a three-case probe it reported 1 finding normally and
 3 with the flag, confirming two were genuinely suppressed.
 
-### Gotcha 2 — `tests/**` is a partial SAST blind spot, deliberately
+### Gotcha 2 — `tests/**` exempts only `S101`, and why it used to exempt more
 
-`[tool.ruff.lint.per-file-ignores]` exempts `S101`, `S105`, `S106`, `S311` and `ANN` under
-`tests/**`, because an attack script cannot be written without asserts, fake credentials
-and generated input.
+`[tool.ruff.lint.per-file-ignores]` exempts `S101` (assert) and `ANN` under `tests/**`,
+because pytest is built on `assert`.
 
-**These per-file-ignores still apply when you pass `--select S` on the command line.** A
-probe file under `tests/` containing a hardcoded secret and `random.randint` reported only
-`S608`; `S105` and `S311` were silently exempt. `--per-file-ignores=''` does not clear them
-(it rejects an empty value). To audit tests fully, bypass config:
+**Until step 3 it also exempted `S105`, `S106` and `S311`** — hardcoded secrets and
+non-cryptographic `random` — across all of `tests/`, not just `tests/attacks/`. Measured
+before removing them: with no exemptions at all, `tests/` raised **124 `S101` and zero
+`S105`/`S106`/`S311`**. Three of the four exemptions suppressed nothing; they were a
+standing pass for code not yet written, and step 3's AS tests are where that code starts.
+A step-3-shaped probe linted as `tests/attacks/test_as_oauth.py` showed what they would
+have hidden:
+
+| Line in the probe | Under `packages/` | Under `tests/`, old config | Now |
+|---|---|---|---|
+| `client_secret = "..."` | `S105` | silent | `S105` |
+| `access_token = "eyJ..."` | `S105` | silent | `S105` |
+| `mint(token="eyJ...")` | `S106` | silent | `S106` |
+| `code_verifier = str(random.randint(...))` | `S311` | silent | `S311` |
+| `def mint(token="eyJ...")` | `S107` | `S107` — never exempted, an inconsistency | `S107` |
+| `SIGNING_KEY = "<a PEM private-key block>"` | silent | silent | silent |
+
+The last row is the one to remember: **ruff's `S105` matches variable *names*** (password,
+secret, token…), and `key` is not one of them. A PEM private key is invisible to ruff
+wherever it lives; only `detect-private-key` and `detect-secrets` see it.
+
+A test that genuinely needs a fake credential now says so on the line, which puts each
+one in the diff and lets `RUF100` report it once unneeded:
+
+```python
+PASSWORD = ...  # noqa: S105  -- fake credential, <why>
+```
+
+with a literal string in place of the `...` (written that way here so this file does not
+trip `detect-secrets` itself). A fake credential that `detect-secrets` *also* flags takes
+`# pragma: allowlist secret` on the same line, as `tests/as_fixtures.py` does.
+
+**Per-file-ignores still apply when you pass `--select S` on the command line**, and
+`--per-file-ignores=''` does not clear them (it rejects an empty value). To audit tests with
+config bypassed entirely:
 
 ```bash
 uv run ruff check --isolated --select S tests/
 ```
 
-That reported both suppressed findings. Occasionally useful; too noisy as a default.
+To lint a snippet *as if* it lived at a path, without writing a file:
+
+```bash
+uv run ruff check --select S --stdin-filename tests/attacks/x.py - < snippet.py
+```
 
 ## 4. Per-step workflow
 
