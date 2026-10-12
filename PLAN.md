@@ -14,30 +14,32 @@ regression test.
 
 ## 0. Where we are
 
-**Last worked: 2026-10-05.** Steps 0, 1 and 2 complete. **Next: step 3** (local
-authorization server) — the first step of Phase 2.
+**Last worked: 2026-10-12.** Steps 0–3 complete. **Next: step 4** (`rlapi` as a resource
+server) — but **fix F-14 first**, see open items.
 
-To resume: read this section, then step 3 below. Sanity check first —
+To resume: read this section, then step 4 below. Sanity check first —
 
 ```bash
-uv run pytest -q           # 91 passed
-uv run pytest -m attack -q # 39 passed, 52 deselected
-uv run mypy                # Success: no issues found in 24 source files
+uv run pytest -q           # 164 passed
+uv run pytest -m attack -q # 57 passed, 107 deselected
+uv run mypy                # Success: no issues found in 37 source files
 uv run ruff check .        # All checks passed
-uv run ruff format --check .   # 30 files already formatted
+uv run ruff format --check .   # 43 files already formatted
 ```
 
-The format count is 24 `.py` **plus the 6 `.md` files**: ruff 0.16 formats Python code
-blocks inside Markdown, so the formatter (and the pre-commit hook) now rewrites code fences
-in these docs too. It read 24 before that was noticed on 2026-10-12.
+The format count is the `.py` files **plus the 6 `.md` files**: ruff 0.16 formats Python
+code blocks inside Markdown, so the formatter (and the pre-commit hook) rewrites code
+fences in these docs too. Noticed 2026-10-12.
 
 `ruff format --check` is in that list because step 2 hit it: `ruff check` passes on code
 `ruff format` would rewrite, and pre-commit runs the formatter, so a commit fails after the
 other three are green. Run all four.
 
-Findings so far are in `THREAT_MODEL.md` F-01 … F-14 (F-14, the `/docs` CDN assets, is open); how to run the security checks is in
+Findings so far are in `THREAT_MODEL.md` F-01 … F-21. **Open:** F-14 (the `/docs` CDN
+assets) and F-21 (CIMD fetching is an SSRF primitive). How to run the security checks is in
 `SECURITYTEST.md`. Commits: `d168708` `cfc5318` `7634dc4` `ee21257` `3a062b5` (step 2
-break) `2fd5138` (step 2 fix).
+break) `2fd5138` (step 2 fix) `dd5b3b5` (test SAST exemptions) `c7ca8e1` (step 3 break),
+then the step 3 fix.
 
 ### Local development
 
@@ -97,6 +99,28 @@ PRAGMA foreign_keys = ON;
 as connection-bootstrap SQL — then verify with `PRAGMA foreign_keys;` and confirm you get
 `1`, because this pragma fails *silently* rather than erroring (F-03).
 
+**Running the authorization server** (added step 3). It refuses to start without a
+signing key and a users file, both under the gitignored `.secrets/` by default:
+
+```bash
+uv run python -m rlas keygen                # .secrets/rlas-signing-key.pem, mode 0600
+uv run python -m rlas hash-password         # prompts twice, prints an scrypt hash
+# write .secrets/rlas-users.json:
+#   {"users": [{"username": "alice", "sub": "1", "roles": ["customer"],
+#               "password_hash": "<the hash>"}]}
+# and, to pre-register clients instead of fetching their metadata documents (F-21):
+#   {"clients": [{"client_id": "https://client.test/cimd.json",
+#                 "redirect_uris": ["http://127.0.0.1:8765/cb"]}]}
+RLAS_CLIENTS_FILE=.secrets/rlas-clients.json \
+  uv run uvicorn --factory rlas.app:asgi_app_from_env --port 9000
+```
+
+Verified 2026-10-12 against scratch files: metadata served, a full S256 code flow over
+real HTTP returned a `Bearer` token with `expires_in` 600, `keygen` refused to overwrite,
+and a key file chmod-ed to 0644 stopped the server at boot. `sub` must be the user's id in
+`rlapi`'s `users` table; nothing checks that yet (open items). `RLAS_ISSUER` overrides the
+default issuer `http://127.0.0.1:9000`.
+
 WAL also means `-wal`/`-shm` sidecars exist while connections are open: copy all three
 files or miss recent commits, and a GUI holding an open transaction can block the app's
 writes until `busy_timeout` (5s) expires.
@@ -113,6 +137,11 @@ writes until `busy_timeout` (5s) expires.
 | 6 | No `IntegrityError` handler, so a duplicate SKU is a 500 | Raised at step 2 and left as-is, pinned by `test_duplicate_sku_is_rejected` asserting the 500 rather than hiding it. A 409 needs an exception handler; step 6 adds one anyway when audit logging needs to catch failed writes. Worth doing then, not before. |
 | 7 | `OrderCreate.customer_id` comes from the request | Any caller can place an order as any customer. That **is** step 5's IDOR and is deliberately left open, not overlooked; `customer_id` becomes the token's `sub`. Flagged here so it is not mistaken for an oversight when reading step 2's code. |
 | 8 | Starlette deprecation warning on every test run | `starlette.testclient` warns that using it with `httpx` is deprecated and wants `httpx2`. Cosmetic today. Worth fixing before step 9, where the attack suite starts asserting on real HTTP behaviour between services and a surprise client-library swap would be badly timed. |
+| 9 | **F-14 must be fixed before step 4** | `/docs` loads unpinned, unhashed Swagger UI from a CDN. Step 4 puts bearer tokens on that page. The fix is small (self-host the assets, `docs_url=None` + a local route) and THREAT_MODEL.md F-14 already describes it and its test. Do it as the first commit of step 4. |
+| 10 | Registered redirect URIs are not validated (F-18) | Exact matching honours whatever a client registers. OAuth 2.1 wants absolute URIs, no fragment, HTTPS for web clients. A check in `clients.parse_metadata` plus a unit test; small, not urgent while clients are pre-registered. |
+| 11 | The AS issues any requested scope to any user | `users:admin` is granted to a `customer` who asks. Step 5 decides which roles may hold which scopes; the AS-side ceiling belongs there too, alongside `rlapi`'s gate. |
+| 12 | `sub` ↔ `rlapi` `users.id` is a manual invariant | `.secrets/rlas-users.json` and the dev database must agree or step 5's row gate compares against the wrong user. Item 1's seed script is the natural place to generate both from one list. |
+| 13 | CIMD fetching is an SSRF primitive (F-21) | HTTPS-only, no redirects, timeout, size cap. No address-range filtering until step 17. Keep `rlas` on loopback; prefer `RLAS_CLIENTS_FILE` in dev. |
 
 ### Checked during step 2 — result
 
@@ -128,14 +157,28 @@ are the actually useful part, both now in `THREAT_MODEL.md`:
 - **F-10 was flagged by nothing.** No rule covers "this Pydantic model lets a client write a
   field the server owns". Step 2's score: two vulnerabilities, SAST found one.
 
-### To check during step 3
+### Checked during step 3 — result
 
-The AS signing key is the first real secret in the repo. Step 0's F-01 work established that
-`detect-secrets` and `detect-private-key` catch key *content* in a tracked file while
-`.gitignore` only matches names — so generate the key to a gitignored path and then
-deliberately try to commit it from a tracked `.py`, and confirm which hook actually fires.
-Ruff `S105`/`S106` were confirmed at step 0; `S505` (weak RSA key size) has never fired and
-step 3 is its first real chance.
+- **Which hook catches the key** (F-20): in a scratch clone, the full PEM was blocked by
+  `detect-private-key` and `detect-secrets`; the PEM body without its header lines, and the
+  key as a JWK, were blocked by `detect-secrets` alone. `detect-private-key` matches the
+  header line. Ruff contributed nothing security-relevant.
+- **`S505` fired** for the first time — on a deliberately weak test key — and is
+  literal-only: a constant one line up hides it (F-19).
+- **SAST found none of the four AS vulnerabilities** (F-02 running total: one of six).
+
+### To check during step 4
+
+- **Will exploit 3 (HS256 signed with the public key) even land?** PyJWT 2.x refuses a
+  PEM-formatted key as an HMAC secret. If it does, the break needs a deliberately older or
+  hand-rolled verifier to demonstrate the bug, and that refusal is a library control worth
+  a ledger row — measure which, do not assume.
+- **`typ: at+jwt`.** `rlas` sets it; PyJWT does not check it by default. RFC 9068 requires
+  the resource server to, so it must be explicit in step 4's decode — confirm by presenting
+  a JWT without it.
+- **`S113`** (request without timeout) is predicted on the JWKS fetch. First chance to
+  fire.
+- F-02's prediction that SAST misses the audience-validation gap is due for its test.
 
 ---
 
@@ -405,6 +448,40 @@ The heart of the learning. ~200 lines of FastAPI implementing OAuth 2.1 properly
    (Fix: exact string comparison, no normalisation, no wildcards.)
 
 **Verify** — `tests/attacks/test_as_oauth.py`, one test per exploit above.
+
+**Status: done.** 164 tests (57 `attack`); ruff + mypy `--strict` clean. Findings in
+`THREAT_MODEL.md` F-15 … F-21. Break committed separately as `c7ca8e1`. `rlas` is ~690
+lines of code (1,051 with docstrings and comments) across ten modules, against the plan's
+~200 — a login, Client ID Metadata Documents and refresh rotation were each more than a
+few lines done properly.
+
+**All four exploits landed, but not quite as written:**
+1. **Exploit 4's first payload was refuted** (F-18). Prefix matching *rejects*
+   `https://evil.test` against `https://client.test/cb` — the host is inside the prefix.
+   What it accepts depends on the registration: other paths on the client's host for a
+   path registration, and full off-host theft via `https://origin.test@evil.test` for a
+   bare-origin one. **PKCE does not help against this**: the attacker starts the flow, so
+   holds the verifier.
+2. **A fifth case the plan did not list** (F-16): a correctly hashed S256 challenge with
+   the method *omitted* is read as `plain` (RFC 7636's default). The legitimate client was
+   refused and a thief presenting the challenge from the URL got a token — the control
+   inverted.
+3. **Code replay is partly defence in depth** (F-17): with S256 in force a thief needs the
+   verifier too. Its larger value is detection — the fix revokes the refresh family on
+   reuse. **Access tokens already issued cannot be revoked**; the 10-minute TTL is what
+   bounds them.
+
+**What the fix consisted of:**
+1. `/authorize` refuses anything but an explicitly stated `S256`, and `verify` has no
+   `plain` or no-challenge branch. Two layers; **either alone stopped every PKCE exploit.**
+2. Codes are `take`n before any check, and a `spent_codes` tombstone revokes the refresh
+   family on reuse.
+3. `redirect_uri in self.redirect_uris` — exact, no normalisation.
+
+**Method note worth carrying forward:** the removal measurements were run with a probe that
+replays each exploit and prints the outcome without asserting. For the two PKCE layers,
+every single removal *failed tests* while the exploit stayed dead — defence in depth is
+indistinguishable from a load-bearing control in test output alone (SECURITYTEST.md §5).
 
 → **MCP01**, **MCP07** · **CHECKPOINT**
 

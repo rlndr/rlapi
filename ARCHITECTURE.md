@@ -1,6 +1,6 @@
 # Architecture
 
-Status: **step 0 baseline.** Components are declared here before they exist; each phase in
+Status: **step 0 baseline, amended at step 3.** Components are declared here before they exist; each phase in
 [PLAN.md](PLAN.md) amends this file as it lands. Treat anything marked *(planned)* as a
 design commitment, not a description of running code.
 
@@ -8,8 +8,8 @@ design commitment, not a description of running code.
 
 | Component | Package | Role | Status |
 |---|---|---|---|
-| `rlapi` | `packages/rlapi` | CRUD API over inventory/orders. OAuth 2.1 **resource server**. Owns the database. | *(planned, steps 1–6)* |
-| `rlas` | `packages/rlas` | OAuth 2.1 **authorization server**. Issues and exchanges tokens. Replaced by Keycloak in step 18. | *(planned, step 3)* |
+| `rlapi` | `packages/rlapi` | CRUD API over inventory/orders. OAuth 2.1 **resource server**. Owns the database. | **CRUD built, steps 1–2**; resource-server auth from step 4 |
+| `rlas` | `packages/rlas` | OAuth 2.1 **authorization server**. Issues and exchanges tokens. Replaced by Keycloak in step 18. | **built, step 3** — code flow, S256 PKCE, refresh rotation, CIMD. Token exchange is step 9 |
 | `rlmcp` | `packages/rlmcp` | MCP server, revision `2026-07-28`. OAuth 2.1 **resource server** to the client, OAuth 2.1 **client** to `rlapi`. | *(planned, steps 7–16)* |
 
 `rlmcp` holds no data. It is a protocol adapter with an authorization decision point. Every
@@ -111,7 +111,7 @@ two-service split — if any row reads "everything", the architecture has failed
 | MCP client / host | One user's scopes, for that token's ~10 min lifetime | Short TTL; audience binding; scope minimization |
 | `rlmcp` | Ability to request exchanged tokens for *authenticated* users only, downscoped per call. **Not** blanket API access. | `rlapi`'s independent authz; no standing service credential; exchange scope limits |
 | `rlapi` | Full database read/write | Nothing above it — this is the authoritative zone, which is why it is the smallest and most-tested component |
-| `rlas` signing key | Mint any token for any user at any audience: total compromise | Key never leaves the AS; short token TTL limits replay only, not forgery. **This is the crown jewel.** |
+| `rlas` signing key | Mint any token for any user at any audience: total compromise | Key never leaves the AS: a 0600 file under gitignored `.secrets/`, refused at boot if group/other-readable or under 2048 bits (step 3). Short token TTL limits replay only, not forgery. **This is the crown jewel.** |
 
 ## 7. Out of scope
 

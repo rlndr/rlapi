@@ -3,7 +3,7 @@
 How to run the security checks in this repo. Every command here has been run against this
 workspace; output shapes are real, not illustrative.
 
-**Scope today:** static analysis (ruff / flake8-bandit) and the attack suite. Dependency
+**Scope today:** static analysis (ruff / flake8-bandit), the attack suite, and secret scanning. Dependency
 scanning fills in at step 17 — see [Coming later](#5-coming-later).
 
 | Layer | Finds | Status |
@@ -75,14 +75,14 @@ working" index — if a step lands and its rule never fired, check why.
 | Rule | Name | Expected at |
 |---|---|---|
 | `S608` | hardcoded-sql-expression | **Confirmed step 2** — fired on the product-search f-string. **Narrower than it looks:** the statement keyword must sit in the *same string expression* as the interpolation (see §4) |
-| `S105` `S106` `S107` | hardcoded-password string / arg / default | **Confirmed step 0.** Step 3 AS secrets |
+| `S105` `S106` `S107` | hardcoded-password string / arg / default | **Confirmed step 0.** Matches variable *names*, not values: silent on a PEM key in `SIGNING_KEY` (F-20). First un-exempted hit in `tests/` at step 3 was a false positive, `body["token_type"] == "Bearer"` |
 | `S104` | hardcoded-bind-all-interfaces | Step 8 — binding `rlmcp` to `0.0.0.0` |
 | `S311` | suspicious-non-cryptographic-random | Step 12 — state handles built with `random` |
 | `S113` | request-without-timeout | Step 9 — JWKS / token-exchange fetches |
 | `S501` `S323` | no cert validation / unverified SSL context | Step 17 — TLS |
 | `S310` | suspicious-url-open-usage | Step 17 — SSRF on OAuth metadata fetches |
 | `S324` `S303` | insecure hash function | Steps 11, 16 — `arguments_hash` |
-| `S505` | weak-cryptographic-key | Step 3 — RSA key size for the AS signing key |
+| `S505` | weak-cryptographic-key | **Confirmed step 3** — fired on a deliberately weak test key. **Literal-only:** `key_size=BITS` with `BITS = 1024` and an EC P-192 key are both silent (F-19) |
 | `S110` `S112` | try-except-pass / -continue | Anywhere a failed authz check gets swallowed |
 | `S602`–`S607` | subprocess / shell | Step 11, if any tool ever shells out |
 
@@ -267,9 +267,9 @@ uv run pytest -m "attack and mcp02"
 uv run pytest                        # everything
 ```
 
-Current counts (step 2): **91 tests, 39 marked `attack`.** Breakdown:
+Current counts (step 3): **164 tests, 57 marked `attack`.** Breakdown:
 
-Note the two numbers are easy to confuse: `pytest tests/attacks/ -q` reports **54**,
+Note the two numbers are easy to confuse: `pytest tests/attacks/ -q` reports **72**,
 because the step-1 modules also hold tests asserting SQLite's *unhardened* defaults,
 which are not themselves exploits and carry no `attack` marker. `pytest -m attack` is
 the number that means "exploits".
@@ -284,6 +284,9 @@ the number that means "exploits".
 | `attacks/test_sqli.py` | `UNION SELECT` exfiltration, `sqlite_master` recon, error-message oracle, LIKE-wildcard abuse, absence of raw SQL | F-08, F-11, F-12 |
 | `integration/test_crud.py` | the endpoints still working — the half that catches a "fix" which rejects everything | — |
 | `unit/test_migrations.py` | migration/model drift, reversibility, no pinned DB URL | F-06, F-07 |
+| `attacks/test_as_oauth.py` | PKCE omitted / `plain` / method omitted; code replay, revocation, burn-on-failure; `redirect_uri` prefix tricks incl. `@` userinfo | F-15 … F-18 |
+| `integration/test_as_flow.py` | the AS working: RFC 9068 token claims, `iss`/`state`, `invalid_target`, refresh rotation and family revocation, login-page headers | — |
+| `unit/test_as_components.py` | key file mode / size / overwrite, CIMD URL and document rules, fetch limits, PKCE `verify` (layer 2), scrypt, the expiring store | F-15, F-19, F-21 |
 
 ### Proving a control is load-bearing
 
@@ -329,6 +332,30 @@ document instead of a payload.
 
 The general lesson for later steps: when a removal makes a test fail, confirm the
 vulnerability is actually back, not just that the assertion is unhappy.
+
+**Step 3's measurements** (162–165 tests at the time). Each removal was run twice over:
+the suite, and a probe that replays every exploit and *prints* the outcome without
+asserting, so "test failed" and "exploit back" are recorded separately:
+
+| Control removed | Tests failed | Exploit back? |
+|---|---|---|
+| `/authorize` requiring stated S256 | 4 | **no** — `verify` still refuses |
+| `plain` in `SUPPORTED_METHODS` | 2 | **no** |
+| `plain` branch in `verify` | 2 | **no** — `/authorize` never issues a plain code |
+| both PKCE layers | 6 | **yes** |
+| `take` → `peek` | 3 | **yes** |
+| `take` after the checks | 1 | partly — no burn on failure |
+| `spent_codes` revocation | 1 | partly — legitimate family survives a replay |
+| exact match → `startswith` | 8 | **yes** — code delivered to `evil.test` |
+
+**No happy-path test failed in any of them.** The PKCE rows are the new lesson: two layers,
+each sufficient alone, each with failing tests when removed — so from test output alone,
+defence in depth is indistinguishable from a control that matters. Only the probe shows
+that removing either one leaves the exploit dead (`THREAT_MODEL.md` F-15).
+
+To run the same kind of probe: write a test that performs the exploit and prints the
+status codes, copy it into `tests/` under a `_`-prefixed name, run with `pytest -s`, and
+delete it. Keep it out of the suite — a test that asserts nothing passes forever.
 
 Markers are declared in `pyproject.toml` (`mcp01`–`mcp10`, plus `attack`). Conventions and
 the per-module header format are in [tests/attacks/README.md](tests/attacks/README.md).

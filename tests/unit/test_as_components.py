@@ -21,6 +21,7 @@ from rlas.keys import (
     jwk_thumbprint,
     load_key_file,
 )
+from rlas.pkce import s256, verify
 from rlas.store import ExpiringStore
 from rlas.users import hash_password, verify_password
 
@@ -162,6 +163,31 @@ def test_resolver_checks_the_url_before_fetching() -> None:
 
     with pytest.raises(ClientError, match="https"):
         _resolver(httpx.MockTransport(must_not_fetch)).resolve("http://client.test/cimd.json")
+
+
+# --- PKCE verify: the second layer -------------------------------------------
+#
+# /authorize refusing non-S256 requests is the first layer, and the attack suite
+# pins it. These pin the second: even if /authorize were loosened, /token has no
+# `plain` comparison to fall back on. Measured at step 3: with only one layer
+# removed the exploits still failed, so each layer needs its own test.
+
+
+def test_verify_accepts_the_s256_preimage() -> None:
+    verifier = "v" * 43
+
+    assert verify(verifier, s256(verifier))
+
+
+def test_verify_never_accepts_the_challenge_as_its_own_verifier() -> None:
+    """What `plain` would accept. A 43-char S256 challenge is a well-formed verifier."""
+    challenge = s256("v" * 43)
+
+    assert not verify(challenge, challenge)
+
+
+def test_verify_rejects_a_missing_verifier() -> None:
+    assert not verify(None, s256("v" * 43))
 
 
 # --- Passwords -----------------------------------------------------------------

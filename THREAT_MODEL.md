@@ -78,6 +78,13 @@ name-based rule never would.
   expression* as the interpolation, so moving `SELECT` into a variable one line up hides the
   same bug completely. The mass-assignment half of step 2 (F-10) was flagged by **nothing**.
   Running total: of the two step-2 vulnerabilities, SAST found one.
+- **Step 3 result — SAST found none of the four AS vulnerabilities.** PKCE optional,
+  `plain` accepted, `peek` instead of `take`, and `startswith` instead of `==` are all
+  ordinary code with no dangerous call to pattern-match; the break committed with zero
+  ruff findings and zero suppressions in `rlas`. The step-3 SAST signal was elsewhere:
+  `S505`'s first firing (F-19, literal-only), and the first un-exempted `S105` in
+  `tests/` being a false positive (`body["token_type"] == "Bearer"`). Running total: of
+  six vulnerabilities across steps 2–3, SAST found one.
 - **Still open:** the step 4, 5 and 12 predictions.
 
 ---
@@ -378,6 +385,186 @@ control must therefore land **before** step 4 wires auth into the docs page, not
 ## Phase 2 — Identity
 *(steps 3–6)*
 
+### F-15 · PKCE optional and `plain` accepted
+- **Severity:** High · **Category:** OAuth · **OWASP:** MCP01, MCP07
+- **Attacked:** step 3 break (`c7ca8e1`). `/authorize` accepted a request with no
+  `code_challenge`, and `verify` returned `True` when none was recorded. `plain` was in
+  `SUPPORTED_METHODS` and advertised in the metadata.
+- **Findings, confirmed by request:**
+  | Flow | Thief holds | Result |
+  |---|---|---|
+  | no PKCE | the code | **token** |
+  | `plain` | the code + the authorization URL | **token** — the challenge *is* the verifier |
+  | S256 | the code + the authorization URL | `invalid_grant` |
+  | S256, verifier omitted at `/token` (RFC 9700 downgrade) | the code | `invalid_grant` — **held at the break** |
+- **Who omits PKCE is the legitimate client**, not the attacker: an old library, or a
+  developer who believes PKCE is for mobile. The AS is the one place that can protect users
+  of such clients, which is why OAuth 2.1 makes it mandatory there.
+- **To be fair to `plain`:** it defends against PKCE's original threat, an app that
+  intercepts only the *redirect*. It fails whenever the attacker can read the request too,
+  and browser history and proxy logs hold both.
+- **Control — two layers, either sufficient alone:**
+  1. `/authorize` refuses any request without `code_challenge` and an explicitly stated
+     `code_challenge_method=S256`. No code is ever minted for a non-S256 flow.
+  2. `pkce.verify(verifier, challenge: str)` has no `plain` branch and no "no challenge"
+     branch. The `str` type means mypy rejects any path that stores a request without one.
+- **Verified by removal — and the result is the F-13 lesson again:**
+  | Removed | Tests failed | Exploit back? |
+  |---|---|---|
+  | layer 1 only | 4 | **no** — codes issued without PKCE, every thief redemption still 400 |
+  | `plain` re-added to `SUPPORTED_METHODS` only | 2 | **no** — `/authorize` accepts it, `verify` still compares S256 |
+  | layer 2 only (`plain` branch back in `verify`) | 2 | **no** — `/authorize` never issues a plain code |
+  | both layers | 6 | **yes** — plain thief and F-16 thief both get tokens |
+  Each single removal *fails tests*, which reads as "this control is load-bearing", while
+  the exploit stays dead because the other layer holds. Defence in depth looks exactly
+  like a redundant control from the test output alone; only replaying the exploit tells
+  them apart. With both layers gone the *no-PKCE* thief was still refused, by a third,
+  unintended piece: `verify` has no branch for a missing challenge.
+- **Tests:** `tests/attacks/test_as_oauth.py` (layer 1, and layer 2 via
+  `test_challenge_from_the_url_does_not_redeem`, since a 43-char S256 challenge is a
+  well-formed verifier); `tests/unit/test_as_components.py` pins layer 2 directly.
+
+### F-16 · An omitted `code_challenge_method` inverted PKCE
+- **Severity:** High · **Category:** OAuth / control inversion · **OWASP:** MCP01
+- **Found:** not in the plan. Probing the break for what "method defaults to `plain`"
+  actually does to a client that otherwise did everything right.
+- **Attacked:** a correctly hashed S256 challenge sent **without**
+  `code_challenge_method`. RFC 7636 §4.3 defaults the method to `plain`, and the break
+  followed the RFC.
+- **Finding:**
+  | Party | Presents | Result |
+  |---|---|---|
+  | legitimate client | its real verifier | **`invalid_grant`** — `verifier == hash` is false |
+  | thief | the challenge, copied from the URL | **token** — `hash == hash` |
+  The control did not merely fail open; it **inverted**. The party holding the secret was
+  refused and the party holding only the public value was served. The length check did not
+  help: a SHA-256 challenge is exactly 43 base64url characters, RFC 7636's *minimum*
+  verifier length.
+- **Why it matters despite being self-limiting:** that client's developer sees every
+  login fail and adds `S256`. Until then, the only party who can complete the flow is an
+  attacker. A spec default that is safe for the client that meant it is actively hostile to
+  the client that forgot it.
+- **Control:** F-15's layer 1 refuses a missing method rather than defaulting it — in
+  either direction. Defaulting to S256 would have "fixed" this client silently and taught it
+  nothing.
+- **Tests:** `test_hashed_challenge_with_omitted_method_is_refused`. The break-phase test
+  `test_omitted_method_defaults_to_plain` used a *raw* secret as the challenge, so it showed
+  the default but not the inversion; this case was missing until the walkthrough.
+
+### F-17 · Authorization codes redeemable twice
+- **Severity:** Medium · **Category:** OAuth · **OWASP:** MCP01
+- **Attacked:** `/token` read codes with `ExpiringStore.peek`, leaving them in place.
+- **Findings, confirmed by request:**
+  - One login, two complete token sets: distinct access tokens, and **two independent
+    refresh families**. Refresh reuse detection works *within* a family, so it could not
+    see this; the replayer held a self-renewing 8-hour session of its own.
+  - A wrong-verifier attempt left the code redeemable; the right verifier then succeeded.
+- **Severity reasoning:** with S256 in force, a thief holding only the code cannot redeem
+  it, replay or not. Replay is dangerous combined with F-15, or when the verifier leaks too
+  (e.g. script injected into a browser-based client). Single use is partly defence in depth;
+  its larger value is **detection**.
+- **Control:** three parts, measured separately —
+  | Part | Removed → tests failed | Exploit back? |
+  |---|---|---|
+  | `peek` → `take` | 3 | **yes** — replay issues tokens, nothing revoked |
+  | `take` *before* the client/redirect/verifier checks | 1 | partly — a failed attempt no longer burns the code |
+  | `spent_codes` tombstone → revoke the family on reuse | 1 | partly — replay refused, but the legitimate family survives |
+  The tombstone outlives the code (8 h, the refresh lifetime), because a replay at minute 5
+  should still revoke, and is written *before* validation, so a failed first attempt is
+  still recognised when replayed. Burning on failure is a deliberate trade: an attacker
+  racing with a wrong verifier forces the victim to sign in again, which beats letting
+  anyone keep guessing.
+- **Residual risk — the part worth being honest about:** revocation reaches **refresh
+  tokens only**. Access tokens already issued from the first redemption are self-contained
+  JWTs that `rlapi` will validate offline (step 4); nothing can recall one. They stay valid
+  until `exp`. The control that bounds the damage is the **10-minute access-token
+  lifetime**, not revocation, which only appears to cover them.
+- **Tests:** `test_code_does_not_redeem_twice`,
+  `test_replay_revokes_the_refresh_family_the_code_started`,
+  `test_failed_redemption_burns_the_code`.
+
+### F-18 · `redirect_uri` prefix matching — PLAN.md's prediction partly refuted
+- **Severity:** Critical against an origin-only registration; Medium otherwise ·
+  **Category:** OAuth · **OWASP:** MCP01, MCP07
+- **Attacked:** `Client.allows_redirect` as `redirect_uri.startswith(registered)`.
+- **PLAN.md predicted** that `https://evil.test` would be accepted where
+  `https://client.test/cb` was registered. **It was not** — 400, no redirect. The host sits
+  inside the registered prefix, so a different host cannot match.
+- **What prefix matching did accept depends entirely on what the client registered:**
+  | Registered | Payload | Code delivered to |
+  |---|---|---|
+  | `https://client.test/cb` | `…/cb/../../evil`, `…/cb.evil`, `…/cbx`, `…/cb?next=…`, `…/cb@evil.test` | `client.test` — other paths on the client's host. Harmful when chained with an open redirect or user content there |
+  | `https://origin.test` | `https://origin.test.evil.test/steal` | `origin.test.evil.test` — attacker's domain |
+  | `https://origin.test` | `https://origin.test@evil.test/steal` | **`evil.test`** — everything before `@` is userinfo |
+  The same bug is minor against one registration and full code theft against another, and
+  registrations are the one input the AS does not choose.
+- **Full chain confirmed:** attacker builds the link with the real `client_id`; the victim
+  sees the genuine login page naming the genuine client, and signs in correctly; the code
+  lands on `evil.test`; `/token` returns a token for the victim's `sub`.
+- **PKCE does not help here, and this is the lesson to keep.** PKCE binds a code to whoever
+  *started* the flow. Here the attacker started it, chose the challenge and kept the
+  verifier, so S256 passed. `state` protects the client, which is never involved; `iss`
+  correctly names `rlas`. PKCE covers a code that *leaks*; redirect matching covers the AS
+  *sending* it. Neither substitutes for the other.
+- **Control:** exact string comparison, `redirect_uri in self.redirect_uris`. Deliberately
+  **no normalisation**: normalising means running a URL parser and trusting it agrees with
+  the browser's, and a disagreement between two parsers is precisely what was exploited.
+- **Verified by removal:** restoring `startswith` fails exactly the 8 redirect tests; the
+  probe again delivers a code to `evil.test`. No happy-path test fails.
+- **Not covered — open:** nothing validates the *registered* URIs (absolute, no fragment,
+  HTTPS for web clients). Exact matching faithfully honours whatever a client registers.
+- **Tests:** the 8 parametrised cases in `tests/attacks/test_as_oauth.py`;
+  `test_unrelated_host_redirect_is_rejected` in `tests/integration/test_as_flow.py` passes
+  before and after, recording the refuted prediction.
+
+### F-19 · ruff `S505` only sees a literal key size
+- **Severity:** Informational · **Category:** DevSecOps / SAST
+- **Found:** `S505` fired for the first time in this project, on the deliberately weak
+  1024-bit key in `test_weak_key_is_refused`. Then probed:
+  | Spelling | `S505` |
+  |---|---|
+  | `rsa.generate_private_key(65537, 1024)` / `key_size=1024` | flagged |
+  | `BITS = 1024` then `key_size=BITS` | **silent** |
+  | `dsa.generate_private_key(key_size=1024)` | flagged |
+  | `ec.generate_private_key(ec.SECP192R1())` | **silent** |
+- Same shape as F-08: no dataflow, so a constant one line up hides the defect. `keys.py`
+  itself passes the size via a constant, which is exactly the spelling the rule cannot see.
+- **Control that actually enforces key strength:** the runtime floor in
+  `SigningKey.from_private_key` (≥ 2048, generated at 3072), which every load path goes
+  through, plus the refusal of group/other-readable key files. Pinned by unit tests.
+
+### F-20 · Key content in a tracked file: only `detect-secrets` caught every encoding
+- **Severity:** Informational · **Category:** Secret hygiene · **OWASP:** MCP01
+- **Attacked:** generated the real signing key to `.secrets/` (gitignored — confirmed with
+  `git check-ignore`), then tried to commit its *content* from a tracked `.py`, in a scratch
+  clone with the hooks installed.
+  | Shape | `detect-private-key` | `detect-secrets` | ruff |
+  |---|---|---|---|
+  | full PEM, header lines included | **blocked** | **blocked** (Private Key) | silent |
+  | PEM body, header lines stripped | missed | **blocked** (high entropy) | `E501` only |
+  | private key as a JWK dict | missed | **blocked** (high entropy) | `E501` only |
+- **`detect-private-key` matches the header line, not the key.** Strip it and the key is
+  invisible to the hook named for it. A JWK is the natural form for a JOSE test fixture.
+- **ruff contributed nothing security-relevant.** `S105` matches variable *names* (password,
+  secret, token…), and neither `SIGNING_KEY` nor `TEST_JWK` is one. It failed only on line
+  length, which reformatting the literal across lines defeats — an incidental control, not
+  a real one.
+- **Residual:** `detect-secrets`' entropy detector is the single layer holding two of three
+  shapes. It is local and bypassable with `--no-verify` (F-01).
+
+### F-21 · Client ID Metadata Document fetching makes the AS an SSRF primitive
+- **Severity:** Medium today (loopback only) · **Category:** SSRF · **OWASP:** MCP07
+- **Found:** by design review while building CIMD support, not by attack. Anyone can send
+  any `client_id` to `/authorize`, and the AS fetches it.
+- **Cheap mitigations in place:** HTTPS only, the `client_id` URL validated before any
+  fetch (path required, no dot segments, no fragment, no userinfo), **no redirects
+  followed**, a 5 s timeout and a 64 KiB size cap — each pinned by a unit test.
+- **Not in place:** blocking loopback, link-local and private address ranges, and
+  resolving-then-pinning the address to defeat DNS rebinding. That is step 17
+  (ARCHITECTURE.md boundary 3). Until then `rlas` must stay on loopback, and
+  `RLAS_CLIENTS_FILE` (pre-registered documents, no fetching) is the safer dev mode.
+- **Status:** open, recorded, not fixed.
+
 ## Phase 3 — The MCP server
 *(steps 7–8)*
 
@@ -414,3 +601,10 @@ actually stopped it?* Controls that stopped nothing get recorded too.
 | F-12 | `q="%"` returning the whole catalogue through a *parameterised* LIKE | `.contains(autoescape=True)` | bound parameters — stop injection, not wildcards |
 | F-13 | `{"id": 9999}` with `extra="forbid"` removed | field absence from `ProductUpdate` — the write never happened | `extra="forbid"` — governs the 422, not the write |
 | F-14 | Third-party JS executing on `/docs`, unpinned and unhashed | nothing — recorded, unfixed | `uv.lock` and `pip-audit` — neither sees browser assets; SRI absent, so the browser cannot check either |
+| F-15 | Code redeemed with no PKCE, or with the `plain` challenge copied from the URL | `/authorize` requiring a stated `S256`; `verify` having no `plain` or no-challenge branch — either alone sufficed | `state`; the `iss` parameter |
+| F-16 | Hashed S256 challenge with the method omitted: legitimate client refused, thief served | refusing a missing `code_challenge_method` | RFC 7636's default (`plain`), followed faithfully; the 43–128 length check — a SHA-256 challenge is exactly 43 |
+| F-17 | Code redeemed twice → two independent token sets | `take` (single use) + tombstone revoking the refresh family | refresh-token reuse detection — per family, blind to a second family; revocation — never reaches issued access tokens, only the 10-min TTL bounds them |
+| F-18 | `redirect_uri` steered off-host via `@` userinfo or a hostname suffix | exact string match | prefix matching; PKCE — the attacker started the flow and held the verifier; `state`; `iss` |
+| F-19 | 1024-bit key size passed through a constant | runtime floor in `SigningKey.from_private_key` | ruff `S505` — literal-only |
+| F-20 | Signing key committed as PEM body or JWK | `detect-secrets` (entropy) | `detect-private-key` — matches the header line only; ruff — `E501` was incidental |
+| F-21 | AS fetching an attacker-chosen `client_id` URL | *partial:* https-only, no redirects, timeout, size cap; loopback deployment | no address-range filtering until step 17 — open |

@@ -5,9 +5,6 @@
 AS fetches it, checks that the document names itself (`client_id` inside equals
 the URL it came from), and takes `redirect_uris` from it.
 
-!!! DELIBERATELY VULNERABLE -- PLAN.md step 3, "break" phase !!!
-`Client.allows_redirect` matches by *prefix*. Exploit 4.
-
 **This module makes the AS an HTTP client of attacker-chosen URLs.** Anyone can
 send any `client_id` to /authorize, and the AS will fetch it. That is SSRF, and
 it is NOT handled here beyond what is cheap: HTTPS only, no redirects followed,
@@ -44,7 +41,17 @@ class Client:
     client_name: str | None = None
 
     def allows_redirect(self, redirect_uri: str) -> bool:
-        return any(redirect_uri.startswith(registered) for registered in self.redirect_uris)
+        """Exact string match against a registered URI. Nothing else.
+
+        No prefix, no wildcard, and deliberately no normalisation. Normalising
+        (case-folding the host, resolving `..`, dropping a default `:443`) means
+        running a URL parser here and trusting that it agrees with the browser's,
+        and disagreement between two parsers is how this check was beaten at
+        the step 3 break: `https://origin.test@evil.test` starts with
+        `https://origin.test` but is delivered to evil.test (THREAT_MODEL.md
+        F-18). A client that wants two callbacks registers two URIs.
+        """
+        return redirect_uri in self.redirect_uris
 
 
 class ClientResolver(Protocol):

@@ -9,7 +9,7 @@ This file is the front door: how to run things. The thinking lives in four other
 listed at the bottom — **[PLAN.md](PLAN.md) is the source of truth for status and what to do
 next.** Don't trust a status line here over that one.
 
-> **Current status:** steps 0–2 complete, step 3 (local authorization server) is next.
+> **Current status:** steps 0–3 complete, step 4 (`rlapi` as a resource server) is next.
 > See [PLAN.md §0](PLAN.md) for the authoritative version.
 
 ---
@@ -91,6 +91,45 @@ with app_from_env() as app:
 
 This never opens the database — SQLAlchemy's `create_engine` is lazy.
 
+## Run the authorization server
+
+`rlas` refuses to start without a signing key and a users file, both under the gitignored
+`.secrets/` by default. One-time setup:
+
+```bash
+uv run python -m rlas keygen         # writes .secrets/rlas-signing-key.pem, mode 0600
+uv run python -m rlas hash-password  # prompts twice (no echo), prints an scrypt hash
+```
+
+Then create `.secrets/rlas-users.json` — `sub` must be the user's id in `rlapi`'s `users`
+table:
+
+```json
+{"users": [{"username": "alice", "sub": "1", "roles": ["customer"], "password_hash": "<hash>"}]}
+```
+
+and, optionally, `.secrets/rlas-clients.json` to pre-register clients:
+
+```json
+{"clients": [{"client_id": "https://client.test/cimd.json", "redirect_uris": ["http://127.0.0.1:8765/cb"]}]}
+```
+
+```bash
+RLAS_CLIENTS_FILE=.secrets/rlas-clients.json \
+  uv run uvicorn --factory rlas.app:asgi_app_from_env --port 9000
+```
+
+Serves on <http://127.0.0.1:9000>; metadata at `/.well-known/oauth-authorization-server`,
+keys at `/.well-known/jwks.json`. Things that will stop it or surprise you:
+
+- **The key file must be mode 0600.** Group- or world-readable keys are refused at boot,
+  as ssh does. `keygen` refuses to overwrite an existing key — delete it deliberately.
+- **Without `RLAS_CLIENTS_FILE`, every `/authorize` fetches the `client_id` URL.** That is
+  an SSRF primitive until step 17 (`THREAT_MODEL.md` F-21). Keep `rlas` on loopback.
+- **PKCE is S256 and the method must be stated.** `code_challenge_method` omitted is an
+  error, not a default (F-16). `redirect_uri` must match a registered one exactly.
+- **Nothing persists.** Codes and refresh tokens are in memory; a restart forgets them.
+
 ## Check everything
 
 Run all five before committing. The first four are the resume sanity check in PLAN.md §0;
@@ -99,14 +138,14 @@ rewrite, and pre-commit runs the formatter — so a commit fails after the other
 green.
 
 ```bash
-uv run pytest -q              # 91 passed
-uv run pytest -m attack -q    # 39 passed, 52 deselected
-uv run mypy                   # Success: no issues found in 24 source files
+uv run pytest -q              # 164 passed
+uv run pytest -m attack -q    # 57 passed, 107 deselected
+uv run mypy                   # Success: no issues found in 37 source files
 uv run ruff check .           # All checks passed
-uv run ruff format --check .  # 30 files (24 .py + 6 .md)
+uv run ruff format --check .  # 43 files (37 .py + 6 .md)
 ```
 
-Those counts are current as of 2026-10-12. The attack suite is the interesting one: each
+Those counts are current as of 2026-10-12 (end of step 3). The attack suite is the interesting one: each
 test proves a specific vulnerability and must **fail to exploit** against fixed code.
 
 Security tooling has its own runbook — **[SECURITYTEST.md](SECURITYTEST.md)** — with the
@@ -142,6 +181,9 @@ Hard-won, in rough order of how likely each is to bite you again:
 - **`/docs` loads Swagger UI from a public CDN**, unpinned and without an integrity hash —
   invisible to `uv.lock` and `pip-audit`. Recorded as `THREAT_MODEL.md` F-14, **open**, and
   it needs fixing before step 4 puts real tokens on that page.
+- **A fake credential in a test needs a per-line suppression**, sometimes two:
+  `# noqa: S105` for ruff and `# pragma: allowlist secret` for `detect-secrets`. There is
+  no blanket exemption for `tests/` any more (SECURITYTEST.md gotcha 2).
 - **The pre-commit hooks are bypassable** with `--no-verify`, and they are local-only.
   They also scan Markdown, so writing *about* a secret in these docs can trip
   `detect-secrets` — reword rather than widening the exclude pattern.
@@ -151,7 +193,7 @@ Hard-won, in rough order of how likely each is to bite you again:
 | File | What it is | Updated |
 |---|---|---|
 | **[PLAN.md](PLAN.md)** | the build plan, step by step, plus "where we are" and open items | every step — **authoritative for status** |
-| **[THREAT_MODEL.md](THREAT_MODEL.md)** | findings F-01…F-14: what was attacked, what actually stopped it, what was theater | every step |
+| **[THREAT_MODEL.md](THREAT_MODEL.md)** | findings F-01…F-21: what was attacked, what actually stopped it, what was theater | every step |
 | **[SECURITYTEST.md](SECURITYTEST.md)** | how to run the security checks; real commands with real output shapes | every step |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | components, trust boundaries, token flows | per phase |
 | **README.md** | this file — how to run things | when a command or workflow changes |

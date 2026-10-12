@@ -1,9 +1,8 @@
 """The authorization server: metadata, JWKS, /authorize, /token.
 
-!!! DELIBERATELY VULNERABLE -- PLAN.md step 3, "break" phase !!!
-- PKCE optional, `plain` accepted (see `pkce.py`)       -- exploits 1 and 2
-- authorization codes redeemable more than once (`/token`) -- exploit 3
-- redirect URIs matched by prefix (see `clients.py`)    -- exploit 4
+The step 3 break (c7ca8e1) shipped four flaws in this flow, each now closed and
+pinned by `tests/attacks/test_as_oauth.py`: PKCE optional, `plain` accepted
+(and defaulted to), codes redeemable twice, redirect URIs matched by prefix.
 
 The flow, and where each check sits:
 
@@ -79,8 +78,8 @@ class AuthorizationRequest:
     scope: tuple[str, ...]
     resource: str
     state: str | None
-    code_challenge: str | None
-    code_challenge_method: str | None
+    #: Always S256 -- `/authorize` refuses anything else -- so the method is not stored.
+    code_challenge: str
 
 
 @dataclass(frozen=True)
@@ -137,6 +136,10 @@ def create_app(
     logins: ExpiringStore[AuthorizationRequest] = ExpiringStore(config.login_ttl, clock)
     codes: ExpiringStore[IssuedCode] = ExpiringStore(config.code_ttl, clock)
     refresh_tokens: ExpiringStore[RefreshGrant] = ExpiringStore(config.refresh_token_ttl, clock)
+    #: Redeemed codes, mapped to the refresh family each one started. A second use
+    #: is then recognised as theft and revokes what the first use issued. Kept as
+    #: long as a refresh token lives, because that is what it may need to revoke.
+    spent_codes: ExpiringStore[str] = ExpiringStore(config.refresh_token_ttl, clock)
     #: Refresh tokens already rotated, kept so that a second use is recognised as
     #: theft rather than looking like an unknown token.
     spent_refresh: ExpiringStore[str] = ExpiringStore(config.refresh_token_ttl, clock)
@@ -203,11 +206,10 @@ def create_app(
 
         if response_type != "code":
             return fail("unsupported_response_type", "only response_type=code is supported")
-        if (
-            code_challenge_method is not None
-            and code_challenge_method not in pkce.SUPPORTED_METHODS
-        ):
-            return fail("invalid_request", "unsupported code_challenge_method")
+        # Required, and S256 must be *stated*: an omitted method means `plain` under
+        # RFC 7636, which is how a correctly hashed challenge became a public verifier.
+        if not code_challenge or code_challenge_method not in pkce.SUPPORTED_METHODS:
+            return fail("invalid_request", "PKCE with code_challenge_method=S256 is required")
         if resource not in config.resources:
             return fail("invalid_target", "resource is missing or not served by this AS")
         requested = tuple(dict.fromkeys((scope or "").split()))
@@ -224,7 +226,6 @@ def create_app(
                 resource=resource,
                 state=state,
                 code_challenge=code_challenge,
-                code_challenge_method=code_challenge_method,
             ),
         )
         label = html.escape(client.client_name or client.client_id)
@@ -303,16 +304,27 @@ def create_app(
     ) -> JSONResponse:
         if not code or not client_id:
             return _token_error("invalid_request", "code and client_id are required")
-        # VULNERABLE: peek leaves the code in place, so it can be redeemed again.
-        issued = codes.peek(code)
+        # `take`, not `peek`, and before any other check: this attempt consumes the
+        # code whatever its outcome, so a wrong verifier burns it rather than leaving
+        # it open to further guesses.
+        issued = codes.take(code)
         if issued is None:
+            # A code already redeemed means two parties hold it. As with refresh
+            # tokens, we cannot tell which is legitimate, so neither keeps the family.
+            # Access tokens already issued from it stay valid until they expire:
+            # they are self-contained JWTs, and nothing here can recall one.
+            family = spent_codes.peek(code)
+            if family is not None:
+                revoked_families.add(family)
             return _token_error("invalid_grant", "unknown, expired or used code")
+        family = secrets.token_urlsafe(16)
+        spent_codes.put(code, family)
         request = issued.request
         if client_id != request.client_id:
             return _token_error("invalid_grant", "code was issued to another client")
         if redirect_uri != request.redirect_uri:
             return _token_error("invalid_grant", "redirect_uri does not match the authorization")
-        if not pkce.verify(code_verifier, request.code_challenge, request.code_challenge_method):
+        if not pkce.verify(code_verifier, request.code_challenge):
             return _token_error("invalid_grant", "PKCE verification failed")
         if resource is not None and resource != request.resource:
             return _token_error("invalid_target", "resource differs from the authorization")
@@ -321,7 +333,7 @@ def create_app(
             user=issued.user,
             scope=request.scope,
             resource=request.resource,
-            family=secrets.token_urlsafe(16),
+            family=family,
         )
 
     def rotate_refresh(
