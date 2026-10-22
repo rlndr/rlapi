@@ -374,21 +374,49 @@ uv sync --locked                                  # verify lockfile is authorita
 ruff reads our code, `pip-audit` reads everyone else's.
 
 **Known blind spot — browser assets (see `THREAT_MODEL.md` F-14).** More precisely,
-`pip-audit` reads everyone else's *Python*. `/docs` and `/redoc` pull Swagger UI and ReDoc
-from `cdn.jsdelivr.net` at page-view time, on floating major-version ranges and with no
-subresource-integrity hash. Nothing in `uv.lock` or `pip-audit` covers them. Checking that
-is a grep, not a scan, and needs the server running:
+`pip-audit` reads everyone else's *Python*. Until step 4, `/docs` and `/redoc` pulled Swagger
+UI and ReDoc from `cdn.jsdelivr.net` on floating ranges with no integrity hash. **Fixed at
+the start of step 4:** Swagger UI 5.33.2 is vendored in
+`packages/rlapi/src/rlapi/static/swagger-ui/`, and ReDoc is gone. The blind spot has moved
+rather than closed: `pip-audit` still cannot see that directory, so the version in its
+`VERSION` file ages silently.
+
+What guards it now, without a server:
 
 ```bash
-curl -s http://127.0.0.1:8000/docs | grep -oE 'https://[^"]+'   # external origins
-curl -s http://127.0.0.1:8000/docs | grep -c 'integrity='        # 0 == no SRI
+uv run pytest tests/attacks/test_docs_supply_chain.py -q   # 6 passed
+cd packages/rlapi/src/rlapi/static/swagger-ui && sha256sum -c SHA256SUMS   # all OK
 ```
 
-Run at step 2: two jsdelivr URLs plus a `fastapi.tiangolo.com` favicon, and `0` for SRI
-(ReDoc's bundle is a third, served on `/redoc` rather than `/docs`).
-`swagger-ui-dist@5` resolved to 5.33.1 and `redoc@2` to 2.5.4 — neither pinned here, so
-both can move without a commit. Re-run this after any FastAPI upgrade, and expect the
-output to change to "no external origins" once F-14 is fixed.
+The tests assert `/docs` references no external origin, every asset it references is
+served locally, `/redoc` is a 404, `validatorUrl` is `null`, and the vendored bytes match
+the manifest. The step-2 grep still works against a running server, and should print
+nothing and `0`:
+
+```bash
+curl -s http://127.0.0.1:8000/docs | grep -oE 'https?://[^"]+'  # expect: nothing
+```
+
+**Refreshing the vendored version** (the residual risk F-14 names):
+
+```bash
+uv run python scripts/vendor_swagger_ui.py <exact.version>   # verifies npm dist.integrity
+# provenance -- the registry hash alone cannot catch a malicious publish:
+cd "$(mktemp -d)" && npm init -y >/dev/null \
+  && npm install --ignore-scripts swagger-ui-dist@<exact.version> && npm audit signatures
+```
+
+Expect "verified registry signatures" and "1 package has a verified attestation". Then
+review the diff and rerun the suite. The script rewrites `SHA256SUMS`, so the manifest test
+proves the bytes are unmodified since vendoring, not that the version is a good one.
+
+**Gotcha: pre-commit rewrites vendored files.** `end-of-file-fixer` and `trailing-whitespace`
+modified three of the vendored files when staged (measured 2026-10-21), breaking their
+hashes. The vendor directory is excluded from those hooks, `mixed-line-ending` and the
+size limit in `.pre-commit-config.yaml`. If you vendor anything else, add it to the same
+`&vendored` exclusion, or the hooks will quietly "fix" it. Also note that `git add -N`
+(intent-to-add) makes `check-added-large-files` pass a 1.5 MB file, because no content is
+staged. Measure hooks against real staging.
 
 ### Type checking as a security control
 

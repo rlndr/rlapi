@@ -14,18 +14,27 @@ regression test.
 
 ## 0. Where we are
 
-**Last worked: 2026-10-12.** Steps 0–3 complete. **Next: step 4** (`rlapi` as a resource
-server) — but **fix F-14 first**, see open items.
+**Last worked: 2026-10-21.** Steps 0–3 complete. **Step 4 in progress:** its first commit,
+the F-14 fix (vendored Swagger UI), is done. **Next:** step 4 proper (`rlapi` as a resource
+server), starting with the break.
 
 To resume: read this section, then step 4 below. Sanity check first —
 
 ```bash
-uv run pytest -q           # 164 passed
-uv run pytest -m attack -q # 57 passed, 107 deselected
-uv run mypy                # Success: no issues found in 37 source files
+uv run pytest -q           # 170 passed
+uv run pytest -m attack -q # 63 passed, 107 deselected
+uv run mypy                # Success: no issues found in 39 source files
 uv run ruff check .        # All checks passed
-uv run ruff format --check .   # 43 files already formatted
+uv run ruff format --check .   # 45 files already formatted
 ```
+
+`mypy` now covers `scripts/` as well (`files` in `pyproject.toml`), added with
+`scripts/vendor_swagger_ui.py`.
+
+**Do not stop servers with `pkill -f` / `pgrep -f` patterns like `uvicorn --factory rlapi`.**
+On 2026-10-21 such a pattern also matched, and killed, a `--reload` dev server that was
+already running in another terminal, and it matched the invoking shell's own command line
+too. Kill by the PID you started, or by port (`ss -ltnp`).
 
 The format count is the `.py` files **plus the 6 `.md` files**: ruff 0.16 formats Python
 code blocks inside Markdown, so the formatter (and the pre-commit hook) rewrites code
@@ -35,11 +44,12 @@ fences in these docs too. Noticed 2026-10-12.
 `ruff format` would rewrite, and pre-commit runs the formatter, so a commit fails after the
 other three are green. Run all four.
 
-Findings so far are in `THREAT_MODEL.md` F-01 … F-21. **Open:** F-14 (the `/docs` CDN
-assets) and F-21 (CIMD fetching is an SSRF primitive). How to run the security checks is in
-`SECURITYTEST.md`. Commits: `d168708` `cfc5318` `7634dc4` `ee21257` `3a062b5` (step 2
-break) `2fd5138` (step 2 fix) `dd5b3b5` (test SAST exemptions) `c7ca8e1` (step 3 break),
-then the step 3 fix.
+Findings so far are in `THREAT_MODEL.md` F-01 … F-21. **Open:** F-21 (CIMD fetching is an
+SSRF primitive). F-14 was fixed 2026-10-21, though its residual risk (a vendored version
+nothing scans) waits for step 17. How to run the security checks is in `SECURITYTEST.md`.
+Commits: `d168708` `cfc5318` `7634dc4` `ee21257` `3a062b5` (step 2 break) `2fd5138` (step 2
+fix) `dd5b3b5` (test SAST exemptions) `c7ca8e1` (step 3 break) `293619b` (step 3 fix), then
+the F-14 fix.
 
 ### Local development
 
@@ -137,7 +147,7 @@ writes until `busy_timeout` (5s) expires.
 | 6 | No `IntegrityError` handler, so a duplicate SKU is a 500 | Raised at step 2 and left as-is, pinned by `test_duplicate_sku_is_rejected` asserting the 500 rather than hiding it. A 409 needs an exception handler; step 6 adds one anyway when audit logging needs to catch failed writes. Worth doing then, not before. |
 | 7 | `OrderCreate.customer_id` comes from the request | Any caller can place an order as any customer. That **is** step 5's IDOR and is deliberately left open, not overlooked; `customer_id` becomes the token's `sub`. Flagged here so it is not mistaken for an oversight when reading step 2's code. |
 | 8 | Starlette deprecation warning on every test run | `starlette.testclient` warns that using it with `httpx` is deprecated and wants `httpx2`. Cosmetic today. Worth fixing before step 9, where the attack suite starts asserting on real HTTP behaviour between services and a surprise client-library swap would be badly timed. |
-| 9 | **F-14 must be fixed before step 4** | `/docs` loads unpinned, unhashed Swagger UI from a CDN. Step 4 puts bearer tokens on that page. The fix is small (self-host the assets, `docs_url=None` + a local route) and THREAT_MODEL.md F-14 already describes it and its test. Do it as the first commit of step 4. |
+| 9 | ~~F-14 must be fixed before step 4~~ | **Done 2026-10-21**, as step 4's first commit. Swagger UI 5.33.2 is vendored and ReDoc dropped. Along the way: pre-commit's fixers rewrote the vendored bytes (now excluded), and the predicted swagger.io validator leak was refuted in a browser. Detail in THREAT_MODEL.md F-14. Leftover: nothing scans `static/swagger-ui/VERSION`, which goes to step 17. |
 | 10 | Registered redirect URIs are not validated (F-18) | Exact matching honours whatever a client registers. OAuth 2.1 wants absolute URIs, no fragment, HTTPS for web clients. A check in `clients.parse_metadata` plus a unit test; small, not urgent while clients are pre-registered. |
 | 11 | The AS issues any requested scope to any user | `users:admin` is granted to a `customer` who asks. Step 5 decides which roles may hold which scopes; the AS-side ceiling belongs there too, alongside `rlapi`'s gate. |
 | 12 | `sub` ↔ `rlapi` `users.id` is a manual invariant | `.secrets/rlas-users.json` and the dev database must agree or step 5's row gate compares against the wrong user. Item 1's seed script is the natural place to generate both from one list. |
@@ -241,8 +251,10 @@ rlapi/
 ├─ THREAT_MODEL.md          ← appended to each step
 ├─ SECURITYTEST.md          ← how to run the security checks; updated each step
 ├─ pyproject.toml           ← uv workspace root
+├─ scripts/
+│  └─ vendor_swagger_ui.py  ← refreshes rlapi's vendored Swagger UI (F-14)
 ├─ packages/
-│  ├─ rlapi/                ← CRUD API
+│  ├─ rlapi/                ← CRUD API; src/rlapi/static/swagger-ui/ is vendored, not ours
 │  ├─ rlas/                 ← local authorization server (steps 3, retired step 17)
 │  └─ rlmcp/                ← MCP server
 └─ tests/
@@ -889,6 +901,8 @@ write the three queries that answer them.
 **Build**
 - `uv lock` committed, `uv sync --locked` in CI, hash-pinned
 - `pip-audit` and an SBOM (CycloneDX) in CI; fail on high severity
+- The vendored Swagger UI (`rlapi/static/swagger-ui/VERSION`, F-14) is invisible to `pip-audit`:
+  give it a check too, e.g. compare against the npm registry's latest 5.x and its advisories
 - Container: non-root user, read-only root filesystem, no shell, dropped capabilities
 - Egress allowlist from `rlmcp` — it should reach `rlas` and `rlapi` and nothing else
 

@@ -365,22 +365,89 @@ document itself. Arbitrary, unverified, silently-updating third-party script the
 origin with a page that holds tokens — MCP01 (Token Mismanagement) as much as MCP04. The
 control must therefore land **before** step 4 wires auth into the docs page, not after.
 
-- **Control:** *none yet — recorded, not fixed.* The fix is `docs_url=None` / `redoc_url=None`
-  plus a local route calling `get_swagger_ui_html(swagger_js_url=..., swagger_css_url=...)`
-  against self-hosted assets. Pinning to an exact version (`@5.33.1`) is strictly better than
-  `@5` but keeps both the third-party origin and the availability dependency, so it is a
-  stopgap, not the fix.
-- **Residual risk after self-hosting:** the assets become *our* supply chain — vendored
-  files age out of security updates, and nothing in `pip-audit` will mention them either.
-  Whoever self-hosts owns a refresh cadence.
+**The range kept moving while this sat open.** Checked again on 2026-10-21, before the fix:
+jsdelivr resolved `@5` to **5.34.0**, three releases past the 5.33.1 seen when this was
+written (5.33.2 on 10-12, 5.33.3 on 10-15, 5.34.0 on 10-19). Nothing here changed in that
+time.
+
+- **Control (step 4, first commit):** `docs_url=None` / `redoc_url=None`, plus a local
+  `/docs` route calling `get_swagger_ui_html` against **swagger-ui-dist 5.33.2 vendored into
+  `rlapi/static/swagger-ui/`**, with the OAuth2 redirect page served locally as well. ReDoc
+  is dropped, not re-hosted. One docs UI is enough to keep current, and ReDoc also pulled
+  Google Fonts.
+  - **Why 5.33.2.** 5.33.1 was older than a two-week waiting period, but its sanitizer is
+    DOMPurify 3.4.13, from before 3.4.14's fix for "possible bypasses when risky tags are
+    allow-listed". 5.33.2's only security-relevant change is the DOMPurify bump to 3.4.16,
+    whose fixes had been public upstream for 4–9 weeks. On a page that will hold tokens,
+    the sanitizer fix outweighed five days of waiting. Chosen by the user, 2026-10-21.
+  - **How it was fetched.** `scripts/vendor_swagger_ui.py` takes an exact version only and
+    checks the tarball against the registry's `dist.integrity` (SHA-512) before extracting.
+    That hash comes from the same registry, so it catches corruption, not a malicious
+    publish. That gap is covered separately: `npm audit signatures` reported a **verified
+    registry signature and a verified SLSA provenance attestation** for 5.33.2, and npm's own
+    install produced a byte-identical bundle. One oddity: the bundle's embedded build info
+    says `gitDirty: true` at revision `7f26236`, the 5.33.2 release commit. That is
+    consistent with a release job bumping the version in the tree, but it is the build
+    reporting on itself.
+  - **The PyPI route was considered and rejected.** `swagger-ui-bundle` would have put the
+    assets under `uv.lock`'s hash pinning, but its latest release (1.1.0, 2023-11) ships
+    Swagger UI **4.15.5**. A lockfile-pinned, three-year-old sanitizer is not an improvement
+    on a floating current one.
+  - **Exact pin on the CDN** (`@5.33.2`) is still a stopgap, not the fix. It keeps the
+    third-party origin and the availability dependency, and the tests reject it (below).
+- **A second egress, predicted and then refuted.** The bundle defaults `validatorUrl` to
+  `https://validator.swagger.io/validator` and renders `<img src="{validatorUrl}?url={spec
+  URL}">` unless the spec URL contains the *substring* `localhost` or `127.0.0.1`. Reading
+  the code predicted that any real hostname would send the spec location to swagger.io on
+  every page view, and that self-hosting would not stop it. **Measured in Firefox, that is
+  wrong for this page:** no badge at `rlapi.test` (mapped to loopback via
+  `network.dns.localDomains`), with or without the setting. Only `StandaloneLayout`
+  renders the badge, and it lives in `swagger-ui-standalone-preset.js`, which FastAPI's
+  page neither loads nor selects (it uses `BaseLayout`). `validatorUrl: null` is set anyway,
+  as a one-line guard on a path that is one layout change from live and that the HTML
+  checks below cannot see, because the URL is built in JS.
+- **Pre-commit would have corrupted the fix.** Staged for real, `check-added-large-files`
+  blocked the 1551 KB bundle, and `end-of-file-fixer` and `trailing-whitespace` *rewrote*
+  three vendored files: neither the bundle nor the CSS ends in a newline, and the licence
+  notices have trailing spaces. The result no longer matched npm's hashes. The vendor
+  directory is now excluded from exactly those hooks plus `mixed-line-ending`; the
+  read-only scanners (`detect-private-key`, `detect-secrets`) still cover it and passed.
+  A hygiene hook that "fixes" files is a tamper path for vendored artifacts, and only the
+  manifest test notices.
+- **Verified in a real browser.** Headless Firefox driven over WebDriver, with every
+  non-loopback request routed to a blackhole proxy, rendered all 12 operations and showed
+  `versions.swaggerUI` = 5.33.2. `performance.getEntriesByType('resource')` listed exactly
+  four fetches, all on `127.0.0.1:8765`: the CSS, the bundle, the favicon and
+  `/openapi.json`. That list includes URLs built by JS at runtime, which no HTML grep
+  sees.
+- **Residual risk:** the assets are now *our* supply chain. 5.33.2 will age, and nothing in
+  `pip-audit` or `uv.lock` will say so. The refresh is `scripts/vendor_swagger_ui.py
+  <version>` plus a reviewed diff, with no cadence enforced yet; step 17 should give
+  `static/swagger-ui/VERSION` a scanner. `StaticFiles` serves the whole directory, so
+  `VERSION`, `LICENSE` and `SHA256SUMS` are public. That's version disclosure, but the
+  rendered page already reveals the version, so it adds nothing. FastAPI's template lists
+  `SwaggerUIBundle.SwaggerUIStandalonePreset`, which is undefined without the preset file.
+  That's harmless, and it is why the badge cannot render.
 - **Worth noting about blame.** This is a framework default doing something reasonable for a
   getting-started experience and wrong for a resource server. No linter flagged it, no test
-  covers it, and `/docs` worked perfectly throughout step 2 — the failure mode of a default
+  covered it, and `/docs` worked perfectly throughout step 2. The failure mode of a default
   is that it never asks to be reviewed.
-- **Status:** open. Revisit at **step 4** (before `/docs` carries tokens) and **step 17**
-  (dependency scanning).
-- **Tests:** none yet. The cheap one needs no network: assert the `/docs` HTML references no
-  external origin. It *fails today*, so it belongs with the fix rather than before it.
+- **Status:** **fixed** at the start of step 4, before `/docs` carries tokens. Revisit at
+  **step 17** (dependency scanning: the vendored version needs a scanner too).
+- **Tests:** `tests/attacks/test_docs_supply_chain.py`, 6 tests. All three written before
+  the fix failed against `293619b` (four external references, CSS not servable locally,
+  `/redoc` 200). Measured by removing each control:
+
+  | Removed | Tests failing |
+  |---|---|
+  | the whole fix (FastAPI defaults) | 4: no external origin, assets served locally, `/redoc` 404, validator off |
+  | `validatorUrl: null` only | 1: validator off |
+  | self-hosting → CDN pinned to `@5.33.2` (the stopgap) | 2: no external origin, assets served locally |
+  | a trailing newline appended to `swagger-ui.css`, as `end-of-file-fixer` does | 1: manifest |
+
+  `test_oauth2_redirect_page_references_no_external_origin` passes against the defaults
+  too, because FastAPI's redirect page is inline. It guards future changes; it was never
+  evidence of the flaw.
 
 ## Phase 2 — Identity
 *(steps 3–6)*
@@ -600,7 +667,7 @@ actually stopped it?* Controls that stopped nothing get recorded too.
 | F-11 | `UNION SELECT` exfiltrating `users.email` + `role`; `sqlite_master` recon; error-message oracle | ORM `select()` with no SQL string | the `ProductRead` response model — constrains types, not provenance |
 | F-12 | `q="%"` returning the whole catalogue through a *parameterised* LIKE | `.contains(autoescape=True)` | bound parameters — stop injection, not wildcards |
 | F-13 | `{"id": 9999}` with `extra="forbid"` removed | field absence from `ProductUpdate` — the write never happened | `extra="forbid"` — governs the 422, not the write |
-| F-14 | Third-party JS executing on `/docs`, unpinned and unhashed | nothing — recorded, unfixed | `uv.lock` and `pip-audit` — neither sees browser assets; SRI absent, so the browser cannot check either |
+| F-14 | Third-party JS executing on `/docs`, unpinned and unhashed | vendored swagger-ui-dist 5.33.2 (registry integrity + provenance checked at fetch, SHA-256 manifest test after); `validatorUrl: null` for the dormant swagger.io egress | `uv.lock` and `pip-audit` (neither sees browser assets); pinning the CDN version exactly (keeps the origin); the PyPI repackaging (Swagger UI 4.15.5); pre-commit's fixers, which *rewrote* the vendored bytes |
 | F-15 | Code redeemed with no PKCE, or with the `plain` challenge copied from the URL | `/authorize` requiring a stated `S256`; `verify` having no `plain` or no-challenge branch — either alone sufficed | `state`; the `iss` parameter |
 | F-16 | Hashed S256 challenge with the method omitted: legitimate client refused, thief served | refusing a missing `code_challenge_method` | RFC 7636's default (`plain`), followed faithfully; the 43–128 length check — a SHA-256 challenge is exactly 43 |
 | F-17 | Code redeemed twice → two independent token sets | `take` (single use) + tombstone revoking the refresh family | refresh-token reuse detection — per family, blind to a second family; revocation — never reaches issued access tokens, only the 10-min TTL bounds them |

@@ -69,8 +69,8 @@ check before suspecting your config.
 | Path | What |
 |---|---|
 | `/healthz` | liveness — returns `{"status":"ok"}` |
-| `/docs` | Swagger UI, interactive |
-| `/redoc` | ReDoc — nicer for reading |
+| `/docs` | Swagger UI, interactive — served from vendored assets, works offline |
+| `/static/swagger-ui/*` | those assets (swagger-ui-dist 5.33.2) |
 | `/openapi.json` | the raw OpenAPI 3.1.0 document |
 | `/products`, `/products/{id}`, `/products/search` | product CRUD |
 | `/orders`, `/orders/{id}`, `/orders/{id}/status` | order CRUD and status transitions |
@@ -178,9 +178,12 @@ Hard-won, in rough order of how likely each is to bite you again:
 - **`--reload` falls back to polling.** `watchfiles` is not installed, so uvicorn uses
   `StatReload` (mtime polling). It works, just slower and heavier; `uv add --dev watchfiles`
   fixes it. Drop `--reload` for anything production-like.
-- **`/docs` loads Swagger UI from a public CDN**, unpinned and without an integrity hash —
-  invisible to `uv.lock` and `pip-audit`. Recorded as `THREAT_MODEL.md` F-14, **open**, and
-  it needs fixing before step 4 puts real tokens on that page.
+- **`/docs` serves a vendored Swagger UI** (5.33.2, in `rlapi/static/swagger-ui/`), not the
+  CDN copy FastAPI defaults to, and `/redoc` is gone (`THREAT_MODEL.md` F-14). `pip-audit`
+  cannot see that directory, so refreshing it is manual:
+  `uv run python scripts/vendor_swagger_ui.py <version>`, then the provenance check in
+  SECURITYTEST.md §6. The pre-commit fixers are excluded from that directory deliberately,
+  because they rewrite the files and break their hashes.
 - **A fake credential in a test needs a per-line suppression**, sometimes two:
   `# noqa: S105` for ruff and `# pragma: allowlist secret` for `detect-secrets`. There is
   no blanket exemption for `tests/` any more (SECURITYTEST.md gotcha 2).

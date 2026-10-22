@@ -102,7 +102,7 @@ warn_unreachable = true
 warn_unused_ignores = true
 disallow_any_unimported = true
 mypy_path = ["packages/rlapi/src", "packages/rlas/src", "packages/rlmcp/src"]
-files = ["packages", "tests"]
+files = ["packages", "scripts", "tests"]
 
 [[tool.mypy.overrides]]
 module = "tests.*"

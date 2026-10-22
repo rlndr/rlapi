@@ -11,6 +11,13 @@
 # S105/S106/S107 caught all four attempts in the step 0 exercise
 # (THREAT_MODEL.md F-01). gitleaks' marginal value here is its broader rule set
 # and history scanning, and this history has no pre-hook window to audit.
+#
+# Vendored Swagger UI (THREAT_MODEL.md F-14) is excluded from the hooks that
+# would block or *rewrite* it, and only those. Measured 2026-10-21: the bundle
+# is 1551 KB, and end-of-file-fixer / trailing-whitespace modified three of the
+# files, so they no longer matched the npm hashes. The secret scanners only read,
+# so they still cover it. test_vendored_assets_match_their_manifest is what
+# notices if a rewrite happens anyway.
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -18,14 +25,18 @@ repos:
       - id: detect-private-key # RSA/EC private keys; rlas generates these in step 3
       - id: check-added-large-files
         args: ["--maxkb=512"]
+        exclude: &vendored ^packages/rlapi/src/rlapi/static/swagger-ui/
       - id: check-merge-conflict
       - id: check-case-conflict
       - id: check-yaml
       - id: check-toml
       - id: end-of-file-fixer
+        exclude: *vendored
       - id: trailing-whitespace
+        exclude: *vendored
       - id: mixed-line-ending
         args: ["--fix=lf"]
+        exclude: *vendored
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.9
